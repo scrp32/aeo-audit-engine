@@ -2,7 +2,8 @@ import datetime
 import json
 import re
 import time
-from urllib.parse import urlparse
+import xml.etree.ElementTree as ET
+from urllib.parse import quote_plus, urlparse
 
 import pandas as pd
 import requests
@@ -247,11 +248,32 @@ BOT_BLOCK_MARKERS = [
 ]
 
 
-def estimate_domain_authority_1000(url: str) -> tuple[str, int]:
+def extract_clean_host(url: str) -> str:
+    """Returns exact normalized hostname (e.g. 'x.com', 'netflix.com') so suffix checks don't false-match."""
     try:
-        netloc = urlparse(url).netloc.lower().replace("www.", "")
+        host = urlparse(url.strip()).netloc.lower()
+        host = host.split(":")[0]
+        if host.startswith("www."):
+            host = host[4:]
+        return host
     except Exception:
-        return ("unknown", 220)
+        return ""
+
+
+def host_matches_allowed(url: str, allowed_domains: list[str]) -> bool:
+    """Exact domain or subdomain match: 'x.com' matches 'x.com' & 'mobile.x.com', NEVER 'netflix.com'."""
+    host = extract_clean_host(url)
+    if not host:
+        return False
+    for d in allowed_domains:
+        d_clean = d.lower().removeprefix("www.")
+        if host == d_clean or host.endswith("." + d_clean):
+            return True
+    return False
+
+
+def estimate_domain_authority_1000(url: str) -> tuple[str, int]:
+    netloc = extract_clean_host(url)
     if not netloc:
         return ("unknown", 220)
 
@@ -277,13 +299,17 @@ def estimate_domain_authority_1000(url: str) -> tuple[str, int]:
 
 def normalize_url(raw_url: str) -> str:
     raw_url = raw_url.strip()
+    # Strip accidental markdown link formatting [label](url)
+    md_match = re.match(r"^\[.*?\]\((https?://.*?)\)$", raw_url)
+    if md_match:
+        raw_url = md_match.group(1).strip()
     if not raw_url.startswith(("http://", "https://")):
         raw_url = "https://" + raw_url
     return raw_url
 
 
 def humanize_domain_name(domain: str) -> str:
-    stem = domain.lower().replace("www.", "").split(".")[0]
+    stem = domain.lower().removeprefix("www.").split(".")[0]
     if "-" in stem:
         return " ".join(w.capitalize() for w in stem.split("-") if w)
     known_splits = {
@@ -354,8 +380,7 @@ def generate_with_resilience(
 
 
 def crawl_homepage_resilient(url: str) -> dict:
-    parsed = urlparse(url)
-    domain = parsed.netloc.lower().replace("www.", "")
+    domain = extract_clean_host(url)
     fallback_brand = humanize_domain_name(domain)
 
     try:
@@ -379,7 +404,7 @@ def crawl_homepage_resilient(url: str) -> dict:
 
         return {
             "final_url": resp.url,
-            "domain": urlparse(resp.url).netloc.lower().replace("www.", "") or domain,
+            "domain": extract_clean_host(resp.url) or domain,
             "title": title,
             "og_site_name": og_site_name,
             "meta_description": meta_desc,
@@ -424,9 +449,9 @@ Return strict JSON:
   "is_b2b_software": true or false,
   "brand_queries": [
     "exact brand query 1 (e.g. \\"Natural Diamond Council\\")",
-    "domain or secondary brand query 2 (e.g. \\"naturaldiamondcouncil.com\\" OR \\"Only Natural Diamonds\\")"
+    "domain or secondary brand query 2 (e.g. \\"Only Natural Diamonds\\")"
   ],
-  "category_discussion_query": "core consumer/buyer debate query for Reddit/Quora (e.g. \\"natural diamonds\\" OR \\"natural diamond vs lab\\")",
+  "category_discussion_query": "core consumer/buyer debate query for Reddit/Quora (e.g. natural diamonds vs lab grown)",
   "relevance_keywords": ["3-5 lowercase keywords that confirm an article/thread is actually about this brand or its exact industry"]
 }}
 """
@@ -448,28 +473,99 @@ Return strict JSON:
             "category": "Consumer / Commercial Brand",
             "is_b2b_software": False,
             "brand_queries": [f'"{b}"', f'"{crawl_data["domain"]}"'],
-            "category_discussion_query": f'"{b}"',
+            "category_discussion_query": b,
             "relevance_keywords": [w.lower() for w in b.split() if len(w) >= 3] + [crawl_data["domain"].split(".")[0]],
         }
+
+
+# --- SEARCH ENGINE PROVIDERS ---
+def search_via_serper(query: str, serper_key: str, gl: str = "in", num: int = 30, search_type: str = "search") -> list[dict]:
+    endpoint = "[https://google.serper.dev/news](https://google.serper.dev/news)" if search_type == "news" else "[https://google.serper.dev/search](https://google.serper.dev/search)"
+    resp = requests.post(
+        endpoint,
+        headers={"X-API-KEY": serper_key, "Content-Type": "application/json"},
+        json={"q": query, "gl": gl, "num": min(num, 100)},
+        timeout=12,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    items = data.get("news", []) if search_type == "news" else data.get("organic", [])
+    return [
+        {
+            "title": it.get("title", ""),
+            "body": it.get("snippet", ""),
+            "href": it.get("link", ""),
+        }
+        for it in items
+        if it.get("link")
+    ]
+
+
+def search_via_tavily(query: str, tavily_key: str, max_results: int = 20, include_domains: list[str] | None = None) -> list[dict]:
+    payload = {
+        "api_key": tavily_key,
+        "query": query,
+        "search_depth": "basic",
+        "max_results": min(max_results, 20),
+    }
+    if include_domains:
+        payload["include_domains"] = include_domains
+    resp = requests.post("[https://api.tavily.com/search](https://api.tavily.com/search)", json=payload, timeout=15)
+    resp.raise_for_status()
+    return [
+        {
+            "title": it.get("title", ""),
+            "body": it.get("content", "")[:200],
+            "href": it.get("url", ""),
+        }
+        for it in resp.json().get("results", [])
+        if it.get("url")
+    ]
+
+
+def search_google_news_rss(query: str, gl: str = "IN", max_res: int = 30) -> list[dict]:
+    url = f"[https://news.google.com/rss/search?q=](https://news.google.com/rss/search?q=){quote_plus(query)}&hl=en-{gl}&gl={gl}&ceid={gl}:en"
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=10)
+        if r.status_code != 200:
+            return []
+        root = ET.fromstring(r.text)
+        out = []
+        for item in root.findall(".//item")[:max_res]:
+            title = item.findtext("title") or ""
+            link = item.findtext("link") or ""
+            source_el = item.find("source")
+            src_url = source_el.attrib.get("url", "") if source_el is not None else ""
+            out.append({"title": title, "body": title, "href": src_url or link})
+        return out
+    except Exception:
+        return []
 
 
 def collect_live_mentions_novastacks_scale(
     brand_meta: dict,
     domain: str,
     market: str,
-) -> tuple[dict, list[str]]:
+    serper_key: str = "",
+    tavily_key: str = "",
+) -> tuple[dict, dict]:
     region_map = {
-        "India": "in-en",
-        "United States": "us-en",
-        "United Kingdom": "uk-en",
-        "Singapore": "sg-en",
-        "Australia": "au-en",
-        "Global": "wt-wt",
+        "India": ("in-en", "in", "IN"),
+        "United States": ("us-en", "us", "US"),
+        "United Kingdom": ("uk-en", "gb", "GB"),
+        "Singapore": ("sg-en", "sg", "SG"),
+        "Australia": ("au-en", "au", "AU"),
+        "Global": ("wt-wt", "us", "US"),
     }
-    region = region_map.get(market, "wt-wt")
+    ddg_region, gl_low, gl_up = region_map.get(market, ("wt-wt", "us", "US"))
     evidence = {ch[0]: [] for ch in CHANNELS}
+    telemetry = {ch[0]: {"raw": 0, "kept": 0} for ch in CHANNELS}
     seen_urls = set()
-    warnings = []
+    diag = {
+        "engine": "Serper (Google SERP)" if serper_key else "Tavily Search" if tavily_key else "Free DDGS + Google RSS",
+        "errors": [],
+        "telemetry": telemetry,
+    }
 
     brand_name = brand_meta.get("brand_name", domain)
     brand_queries = brand_meta.get("brand_queries") or [f'"{brand_name}"']
@@ -490,38 +586,50 @@ def collect_live_mentions_novastacks_scale(
         "Instagram": ["instagram.com"],
     }
 
-    def is_relevant(title: str, snippet: str, url: str) -> bool:
+    def is_relevant(title: str, snippet: str, url: str, strict: bool = True) -> bool:
         hay = f"{title} {snippet} {url}".lower()
+        # Always accept domain or long domain stem
         if domain.lower() in hay or (len(domain_stem) >= 5 and domain_stem in hay):
             return True
-        if len(clean_brand) >= 4 and clean_brand.lower() in hay:
+        # Accept multi-word or >=5 char brand names
+        if len(clean_brand) >= 5 and clean_brand.lower() in hay:
+            return True
+        # For explicit brand queries on longer brands, trust search engine ranking if not strict
+        if not strict and len(clean_brand) >= 5:
+            return True
+        # Keyword check (also matches individual significant tokens of brand_name)
+        brand_tokens = [t.lower() for t in clean_brand.split() if len(t) >= 4]
+        if any(tok in hay for tok in brand_tokens):
             return True
         if rel_keywords and any(kw in hay for kw in rel_keywords):
             return True
         return False
 
     def ingest(
+        channel_name: str,
         raw_list: list[dict],
-        target_bucket: list[dict],
         cap: int,
         required_domains: list[str] | None = None,
         exclude_own_domain: bool = False,
+        strict_relevance: bool = True,
     ):
+        telemetry[channel_name]["raw"] += len(raw_list)
+        target_bucket = evidence[channel_name]
         for it in raw_list:
             if len(target_bucket) >= cap:
                 break
             u = it.get("href") or it.get("url") or ""
             if not u or u in seen_urls:
                 continue
-            u_low = u.lower()
-            if required_domains and not any(d in u_low for d in required_domains):
+            # Exact hostname/subdomain match (prevents 'x.com' from matching 'netflix.com')
+            if required_domains and not host_matches_allowed(u, required_domains):
                 continue
             title_txt = it.get("title", "").strip()
             snip_txt = (it.get("body") or it.get("snippet") or "").strip()[:180]
-            if not is_relevant(title_txt, snip_txt, u):
+            if not is_relevant(title_txt, snip_txt, u, strict=strict_relevance):
                 continue
             dom, da = estimate_domain_authority_1000(u)
-            if exclude_own_domain and domain.lower() in dom.lower():
+            if exclude_own_domain and (dom == domain.lower() or dom.endswith("." + domain.lower())):
                 continue
             seen_urls.add(u)
             target_bucket.append(
@@ -533,97 +641,90 @@ def collect_live_mentions_novastacks_scale(
                     "authority_1000": da,
                 }
             )
+        telemetry[channel_name]["kept"] = len(target_bucket)
 
-    def multi_backend_text(ddgs_client, query: str, max_res: int) -> list[dict]:
-        for bk in ["bing", "lite", "auto"]:
+    def run_web_query(query: str, max_res: int, include_domains: list[str] | None = None) -> list[dict]:
+        if serper_key:
             try:
+                return search_via_serper(query, serper_key, gl=gl_low, num=max_res, search_type="search")
+            except Exception as e:
+                diag["errors"].append(f"Serper: {str(e)[:120]}")
+
+        if tavily_key:
+            try:
+                return search_via_tavily(query, tavily_key, max_results=max_res, include_domains=include_domains)
+            except Exception as e:
+                diag["errors"].append(f"Tavily: {str(e)[:120]}")
+
+        try:
+            with DDGS() as ddgs:
                 time.sleep(0.25)
-                res = list(ddgs_client.text(query, region=region, backend=bk, max_results=max_res))
+                res = list(ddgs.text(query, region=ddg_region, max_results=max_res))
                 if res:
                     return res
-            except Exception as e:
-                msg = f"{bk}: {str(e)[:100]}"
-                if msg not in warnings:
-                    warnings.append(msg)
+        except Exception as e:
+            msg = f"DDGS web blocked on cloud IP: {str(e)[:90]}"
+            if msg not in diag["errors"]:
+                diag["errors"].append(msg)
         return []
 
-    def safe_ddgs_news(ddgs_client, query: str, max_res: int) -> list[dict]:
-        try:
-            time.sleep(0.25)
-            return list(ddgs_client.news(query, region=region, max_results=max_res))
-        except Exception as e:
-            msg = str(e)[:120]
-            if msg not in warnings:
-                warnings.append(msg)
-            return []
+    # 1. Social & Forum channels
+    for name, site_filter, _, cap in CHANNELS:
+        if name in ("Web", "News"):
+            continue
+        req_doms = domain_matchers.get(name)
 
-    def fetch_reddit_direct_json(query: str, limit: int = 35) -> list[dict]:
+        # Pass 1: Direct brand query (relaxed relevance since brand was explicitly queried)
+        r1 = run_web_query(f"{clean_brand} {site_filter}", cap, include_domains=req_doms)
+        ingest(name, r1, cap, required_domains=req_doms, strict_relevance=False)
+
+        # Pass 2: Category debate query on Reddit & Quora (strict relevance)
+        if name in ("Reddit", "Quora") and len(evidence[name]) < cap and clean_cat.lower() != clean_brand.lower():
+            r2 = run_web_query(f"{clean_cat} {site_filter}", cap, include_domains=req_doms)
+            ingest(name, r2, cap, required_domains=req_doms, strict_relevance=True)
+
+    # 2. News (50 target)
+    if serper_key:
         try:
-            r = requests.get(
-                "[https://www.reddit.com/search.json](https://www.reddit.com/search.json)",
-                params={"q": query, "limit": limit, "sort": "relevance"},
-                headers={"User-Agent": "Mozilla/5.0 (compatible; BrandAuditBot/1.0)"},
-                timeout=10,
+            ingest(
+                "News",
+                search_via_serper(clean_brand, serper_key, gl=gl_low, num=35, search_type="news"),
+                50,
+                strict_relevance=False,
             )
-            if r.status_code != 200:
-                return []
-            children = r.json().get("data", {}).get("children", [])
-            out = []
-            for ch in children:
-                d = ch.get("data", {})
-                permalink = d.get("permalink", "")
-                if permalink:
-                    out.append(
-                        {
-                            "title": d.get("title", ""),
-                            "body": (d.get("selftext") or d.get("subreddit_name_prefixed") or "")[:180],
-                            "href": f"[https://www.reddit.com](https://www.reddit.com){permalink}",
-                        }
-                    )
-            return out
+            if len(evidence["News"]) < 50 and clean_cat.lower() != clean_brand.lower():
+                ingest(
+                    "News",
+                    search_via_serper(clean_cat, serper_key, gl=gl_low, num=25, search_type="news"),
+                    50,
+                    strict_relevance=True,
+                )
+        except Exception as e:
+            diag["errors"].append(f"Serper News: {str(e)[:120]}")
+    else:
+        try:
+            with DDGS() as ddgs:
+                ingest("News", list(ddgs.news(clean_brand, region=ddg_region, max_results=30)), 50, strict_relevance=False)
+                if len(evidence["News"]) < 50 and clean_cat.lower() != clean_brand.lower():
+                    ingest("News", list(ddgs.news(clean_cat, region=ddg_region, max_results=30)), 50, strict_relevance=True)
         except Exception:
-            return []
+            pass
+        if len(evidence["News"]) < 25:
+            ingest("News", search_google_news_rss(clean_brand, gl=gl_up, max_res=30), 50, strict_relevance=False)
 
-    with DDGS() as ddgs:
-        for name, site_filter, _, cap in CHANNELS:
-            if name in ("Web", "News"):
-                continue
-            req_doms = domain_matchers.get(name)
+    # 3. General Web (100 target)
+    excl = "-site:reddit.com -site:quora.com -site:youtube.com -site:facebook.com -site:instagram.com -site:x.com"
+    w1 = run_web_query(f"{clean_brand} {excl}", 60)
+    ingest("Web", w1, 100, exclude_own_domain=True, strict_relevance=False)
+    if len(evidence["Web"]) < 100 and clean_cat.lower() != clean_brand.lower():
+        w2 = run_web_query(f"{clean_cat} {excl}", 60)
+        ingest("Web", w2, 100, exclude_own_domain=True, strict_relevance=True)
 
-            r1 = multi_backend_text(ddgs, f"{clean_brand} {site_filter}", cap)
-            ingest(r1, evidence[name], cap, required_domains=req_doms)
+    if len(evidence["Web"]) == 0 and not serper_key and not tavily_key:
+        rss_web = search_google_news_rss(f"{clean_brand} OR {clean_cat}", gl=gl_up, max_res=30)
+        ingest("Web", rss_web, 40, exclude_own_domain=True, strict_relevance=True)
 
-            if len(evidence[name]) < cap:
-                plat_word = "twitter" if name == "X" else name.lower()
-                r2 = multi_backend_text(ddgs, f"{clean_brand} {plat_word}", cap)
-                ingest(r2, evidence[name], cap, required_domains=req_doms)
-
-            if name in ("Reddit", "Quora") and len(evidence[name]) < cap and clean_cat.lower() != clean_brand.lower():
-                plat_word = name.lower()
-                r3 = multi_backend_text(ddgs, f"{clean_cat} {site_filter}", cap)
-                ingest(r3, evidence[name], cap, required_domains=req_doms)
-                if len(evidence[name]) < cap:
-                    r4 = multi_backend_text(ddgs, f"{clean_cat} {plat_word}", cap)
-                    ingest(r4, evidence[name], cap, required_domains=req_doms)
-
-        if len(evidence["Reddit"]) < 15:
-            ingest(fetch_reddit_direct_json(clean_brand, 30), evidence["Reddit"], 45, required_domains=["reddit.com"])
-            if len(evidence["Reddit"]) < 25 and clean_cat.lower() != clean_brand.lower():
-                ingest(fetch_reddit_direct_json(clean_cat, 30), evidence["Reddit"], 45, required_domains=["reddit.com"])
-
-        n1 = safe_ddgs_news(ddgs, clean_brand, 30)
-        ingest(n1, evidence["News"], 50)
-        if len(evidence["News"]) < 50 and clean_cat.lower() != clean_brand.lower():
-            n2 = safe_ddgs_news(ddgs, clean_cat, 30)
-            ingest(n2, evidence["News"], 50)
-
-        w1 = multi_backend_text(ddgs, clean_brand, 60)
-        ingest(w1, evidence["Web"], 100, exclude_own_domain=True)
-        if len(evidence["Web"]) < 100 and clean_cat.lower() != clean_brand.lower():
-            w2 = multi_backend_text(ddgs, clean_cat, 60)
-            ingest(w2, evidence["Web"], 100, exclude_own_domain=True)
-
-    return evidence, warnings
+    return evidence, diag
 
 
 def run_brand_intelligence_pipeline(
@@ -633,11 +734,15 @@ def run_brand_intelligence_pipeline(
     market: str,
     competitors_override: list[str],
     brand_override: str = "",
+    serper_key: str = "",
+    tavily_key: str = "",
 ) -> dict:
     brand_meta = resolve_brand_queries_via_llm(client, model_name, crawl_data, market, brand_override)
     brand = brand_meta["brand_name"]
 
-    evidence, search_warnings = collect_live_mentions_novastacks_scale(brand_meta, crawl_data["domain"], market)
+    evidence, search_diag = collect_live_mentions_novastacks_scale(
+        brand_meta, crawl_data["domain"], market, serper_key=serper_key, tavily_key=tavily_key
+    )
 
     actual_counts = {ch: len(items) for ch, items in evidence.items()}
     total_harvested = sum(actual_counts.values())
@@ -822,7 +927,8 @@ Return strict JSON:
         "total_mentions": total_harvested,
         "active_platforms": active_channel_count,
         "avg_da": avg_da,
-        "search_warnings": search_warnings,
+        "search_diag": search_diag,
+        "brand_meta": brand_meta,
         "subscores": {
             "Sentiment": {"score": sent_score, "weight": "30%", "basis": f"{pos_pct}% positive across analyzed web"},
             "Volume": {"score": vol_score, "weight": "20%", "basis": f"{total_harvested} total harvested mentions"},
@@ -855,6 +961,21 @@ with st.sidebar:
     api_key = st.secrets.get("GEMINI_API_KEY", "") if hasattr(st, "secrets") else ""
     if not api_key:
         api_key = st.text_input("Gemini API Key", type="password", help="Or set GEMINI_API_KEY in Streamlit Secrets")
+
+    serper_key = st.secrets.get("SERPER_API_KEY", "") if hasattr(st, "secrets") else ""
+    tavily_key = st.secrets.get("TAVILY_API_KEY", "") if hasattr(st, "secrets") else ""
+    if not serper_key and not tavily_key:
+        with st.expander("🔍 Search API Key (Fixes Cloud IP 0s)", expanded=True):
+            serper_key = st.text_input(
+                "Serper.dev API Key (Recommended)",
+                type="password",
+                help="Free 2,500 Google SERP queries at serper.dev",
+            )
+            tavily_key = st.text_input(
+                "OR Tavily API Key",
+                type="password",
+                help="Optional alternative: free 1,000 searches/mo at tavily.com",
+            )
 
     target_url = st.text_input("Target Website URL", placeholder="[https://www.naturaldiamondcouncil.com](https://www.naturaldiamondcouncil.com)")
     brand_override = st.text_input("Brand Name (optional)", placeholder="Auto-detected from site if blank")
@@ -910,7 +1031,14 @@ if run_btn:
         client = genai.Client(api_key=api_key)
         try:
             report = run_brand_intelligence_pipeline(
-                client, model_name, crawl_data, market, comps, brand_override
+                client,
+                model_name,
+                crawl_data,
+                market,
+                comps,
+                brand_override,
+                serper_key=serper_key,
+                tavily_key=tavily_key,
             )
         except Exception as e:
             st.error(f"API Quota / Model Error: {e}")
@@ -937,11 +1065,13 @@ active_platforms = report["active_platforms"]
 sent = ai.get("sentiment", {})
 neg_share = sent.get("negative_pct", 0)
 health_score = report["brand_health_score"]
+search_diag = report.get("search_diag", {})
 
-if report.get("search_warnings") and total_mentions == 0:
+if search_diag.get("errors"):
     st.warning(
-        f"Search engine rate-limit noticed on Streamlit Cloud IP: `{report['search_warnings'][0]}`. "
-        "Wait 30 seconds and click Generate Full Report again."
+        f"**Search Engine Notice ({search_diag.get('engine')}):** `{search_diag['errors'][0]}` — "
+        "Streamlit Cloud's shared AWS IP is blocked by free web scrapers for `site:reddit.com` / `site:quora.com`. "
+        "Paste a free **Serper.dev API key** in the sidebar to populate all 9 platforms."
     )
 
 pill_colors = {
@@ -1065,6 +1195,19 @@ table_html = (
     '</tbody></table>'
 )
 st.markdown(table_html, unsafe_allow_html=True)
+
+with st.expander("🔎 Harvest Telemetry (Raw Search Hits vs. Kept After Filtering)"):
+    tel = search_diag.get("telemetry", {})
+    bmeta = report.get("brand_meta", {})
+    st.caption(
+        f"Engine: **{search_diag.get('engine')}** | Resolved Brand: **{bmeta.get('brand_name')}** | "
+        f"Category Query: `{bmeta.get('category_discussion_query')}` | Keywords: `{bmeta.get('relevance_keywords')}`"
+    )
+    if tel:
+        tel_df = pd.DataFrame(
+            [{"Platform": k, "Raw Hits": v["raw"], "Kept": v["kept"]} for k, v in tel.items()]
+        )
+        st.dataframe(tel_df, use_container_width=True, hide_index=True)
 
 st.markdown('<hr class="report-divider">', unsafe_allow_html=True)
 
