@@ -1,18 +1,20 @@
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import datetime
 import html
 import json
 import re
+import threading
 import time
-import xml.etree.ElementTree as ET
 from urllib.parse import quote_plus, urlparse, urlunparse
+import xml.etree.ElementTree as ET
 
-import pandas as pd
-import requests
-import streamlit as st
 from bs4 import BeautifulSoup
 from ddgs import DDGS
 from google import genai
 from google.genai import types
+import pandas as pd
+import requests
+import streamlit as st
 
 st.set_page_config(
     page_title="Brand Intelligence & AEO Report",
@@ -583,7 +585,7 @@ def search_via_serper(
         endpoint,
         headers={"X-API-KEY": serper_key, "Content-Type": "application/json"},
         json=payload,
-        timeout=12,
+        timeout=10,
     )
     resp.raise_for_status()
     data = resp.json()
@@ -609,7 +611,7 @@ def search_via_tavily(query: str, tavily_key: str, max_results: int = 20, includ
     }
     if include_domains:
         payload["include_domains"] = include_domains
-    resp = requests.post("[https://api.tavily.com/search](https://api.tavily.com/search)", json=payload, timeout=15)
+    resp = requests.post("[https://api.tavily.com/search](https://api.tavily.com/search)", json=payload, timeout=12)
     resp.raise_for_status()
     return [
         {
@@ -626,7 +628,7 @@ def search_via_tavily(query: str, tavily_key: str, max_results: int = 20, includ
 def search_google_news_rss(query: str, gl: str = "IN", max_res: int = 30) -> list[dict]:
     url = f"[https://news.google.com/rss/search?q=](https://news.google.com/rss/search?q=){quote_plus(query)}&hl=en-{gl}&gl={gl}&ceid={gl}:en"
     try:
-        r = requests.get(url, headers=HEADERS, timeout=10)
+        r = requests.get(url, headers=HEADERS, timeout=8)
         if r.status_code != 200:
             return []
         root = ET.fromstring(r.text)
@@ -655,7 +657,6 @@ def build_channel_query_bank(
     primary = aliases[0]
     variants: list[tuple[str, bool, str]] = []
 
-    # 1. Exact & unquoted brand + aliases across all channels
     for al in aliases[:3]:
         variants.append((f'"{al}" {site_filter}'.strip(), False, "Direct Brand"))
         variants.append((f"{al} {site_filter}".strip(), True, "Brand Broad"))
@@ -663,7 +664,6 @@ def build_channel_query_bank(
     if len(domain_stem) >= 6:
         variants.append((f"{domain_stem} {site_filter}".strip(), True, "Domain Mention"))
 
-    # 2. High-intent modifier bank for high-volume forums (Reddit, Quora) & general Web
     if channel_name in ("Reddit", "Quora", "Web"):
         intent_modifiers = [
             f'"{primary}" review',
@@ -680,7 +680,6 @@ def build_channel_query_bank(
         for q in intent_modifiers:
             variants.append((f"{q} {site_filter}".strip(), True, "Brand Intent"))
 
-        # 3. LLM debate queries + category recommendations (strict relevance enforced)
         for dq in debate_queries[:4]:
             variants.append((f"{dq} {site_filter}".strip(), True, "Category Debate"))
 
@@ -688,7 +687,6 @@ def build_channel_query_bank(
             variants.append((f"{cat} recommendations {site_filter}".strip(), True, "Category Recs"))
             variants.append((f"best {cat} {site_filter}".strip(), True, "Category Best"))
 
-    # Deduplicate while preserving priority order
     seen_q = set()
     deduped = []
     for q, strict, src in variants:
@@ -718,8 +716,17 @@ def collect_live_mentions_novastacks_scale(
     evidence = {ch[0]: [] for ch in CHANNELS}
     telemetry = {ch[0]: {"raw": 0, "kept": 0, "queries_run": 0} for ch in CHANNELS}
     seen_urls = set()
+    state_lock = threading.Lock()
+
+    has_paid_search = bool(serper_key or tavily_key)
     diag = {
-        "engine": "Serper (Google SERP Variant Bank)" if serper_key else "Tavily Search" if tavily_key else "Free DDGS + Google RSS",
+        "engine": (
+            "Serper (Parallel Multi-Variant SERP)"
+            if serper_key
+            else "Tavily (Parallel Search)"
+            if tavily_key
+            else "Free DDGS + Google RSS (Parallel)"
+        ),
         "errors": [],
         "telemetry": telemetry,
     }
@@ -775,42 +782,43 @@ def collect_live_mentions_novastacks_scale(
         exact_brand_only: bool = False,
         match_source: str = "Brand Mention",
     ):
-        telemetry[channel_name]["raw"] += len(raw_list)
-        target_bucket = evidence[channel_name]
-        for it in raw_list:
-            if len(target_bucket) >= cap:
-                break
-            u = it.get("href") or it.get("url") or ""
-            if not u:
-                continue
-            canon_u = canonicalize_url(u)
-            if canon_u in seen_urls:
-                continue
-            if required_domains and not host_matches_allowed(u, required_domains):
-                continue
-            title_txt = clean_serp_title(it.get("title", ""))
-            snip_txt = (it.get("body") or it.get("snippet") or "").strip()[:260]
-            if not is_relevant(title_txt, snip_txt, u, strict=strict_relevance, exact_brand_only=exact_brand_only):
-                continue
-            dom, da = estimate_domain_authority_1000(u)
-            if exclude_own_domain and (dom == domain.lower() or dom.endswith("." + domain.lower())):
-                continue
-            seen_urls.add(canon_u)
-            tag_label = extract_subreddit_or_tag(u, fallback=match_source)
-            sent_label = infer_quick_sentiment(f"{title_txt} {snip_txt}")
-            target_bucket.append(
-                {
-                    "title": title_txt,
-                    "snippet": snip_txt,
-                    "url": u,
-                    "domain": dom,
-                    "authority_1000": da,
-                    "tag": tag_label,
-                    "sentiment": sent_label,
-                    "date": it.get("date", ""),
-                }
-            )
-        telemetry[channel_name]["kept"] = len(target_bucket)
+        with state_lock:
+            telemetry[channel_name]["raw"] += len(raw_list)
+            target_bucket = evidence[channel_name]
+            for it in raw_list:
+                if len(target_bucket) >= cap:
+                    break
+                u = it.get("href") or it.get("url") or ""
+                if not u:
+                    continue
+                canon_u = canonicalize_url(u)
+                if canon_u in seen_urls:
+                    continue
+                if required_domains and not host_matches_allowed(u, required_domains):
+                    continue
+                title_txt = clean_serp_title(it.get("title", ""))
+                snip_txt = (it.get("body") or it.get("snippet") or "").strip()[:260]
+                if not is_relevant(title_txt, snip_txt, u, strict=strict_relevance, exact_brand_only=exact_brand_only):
+                    continue
+                dom, da = estimate_domain_authority_1000(u)
+                if exclude_own_domain and (dom == domain.lower() or dom.endswith("." + domain.lower())):
+                    continue
+                seen_urls.add(canon_u)
+                tag_label = extract_subreddit_or_tag(u, fallback=match_source)
+                sent_label = infer_quick_sentiment(f"{title_txt} {snip_txt}")
+                target_bucket.append(
+                    {
+                        "title": title_txt,
+                        "snippet": snip_txt,
+                        "url": u,
+                        "domain": dom,
+                        "authority_1000": da,
+                        "tag": tag_label,
+                        "sentiment": sent_label,
+                        "date": it.get("date", ""),
+                    }
+                )
+            telemetry[channel_name]["kept"] = len(target_bucket)
 
     def run_web_query(
         query: str,
@@ -824,34 +832,42 @@ def collect_live_mentions_novastacks_scale(
             try:
                 return search_via_serper(query, serper_key, gl=gl_use, num=max_res, page=page, search_type="search")
             except Exception as e:
-                diag["errors"].append(f"Serper: {str(e)[:120]}")
+                with state_lock:
+                    diag["errors"].append(f"Serper: {str(e)[:120]}")
 
         if tavily_key and page == 1:
             try:
                 return search_via_tavily(query, tavily_key, max_results=max_res, include_domains=include_domains)
             except Exception as e:
-                diag["errors"].append(f"Tavily: {str(e)[:120]}")
+                with state_lock:
+                    diag["errors"].append(f"Tavily: {str(e)[:120]}")
 
         if page == 1:
             try:
-                with DDGS() as ddgs:
-                    time.sleep(0.18)
+                with DDGS(timeout=8) as ddgs:
                     res = list(ddgs.text(query, region=ddg_region, max_results=max_res))
                     if res:
                         return res
             except Exception as e:
                 msg = f"DDGS web: {str(e)[:90]}"
-                if msg not in diag["errors"]:
-                    diag["errors"].append(msg)
+                with state_lock:
+                    if msg not in diag["errors"]:
+                        diag["errors"].append(msg)
         return []
 
-    # 1. Loop through per-channel query variant bank until cap is hit
+    # 1. Build parallel task queue (full intent bank on Serper/Tavily; tight 4-variant cap on free DDGS so it never hangs)
+    max_variants_forum = 14 if has_paid_search else 4
+    max_variants_other = 4 if has_paid_search else 2
+    max_workers = 8 if has_paid_search else 3
+
+    tasks = []
     for name, site_filter, _, cap in CHANNELS:
         if name == "News":
             continue
         req_doms = domain_matchers.get(name)
         is_g2 = name == "G2"
         is_web = name == "Web"
+        limit_q = max_variants_forum if name in ("Reddit", "Quora", "Web") else max_variants_other
 
         q_bank = build_channel_query_bank(
             channel_name=name,
@@ -860,14 +876,22 @@ def collect_live_mentions_novastacks_scale(
             debate_queries=debate_queries,
             domain_stem=domain_stem,
             site_filter=site_filter,
-        )
+        )[:limit_q]
 
         for idx, (q, strict_flag, src_label) in enumerate(q_bank):
-            if len(evidence[name]) >= cap:
-                break
             batch_size = 40 if is_web else 25
+            tasks.append((name, cap, req_doms, is_g2, is_web, q, batch_size, gl_low, strict_flag, src_label))
+            if name in ("Reddit", "Quora") and gl_low != "us" and idx < 4 and has_paid_search:
+                tasks.append((name, cap, req_doms, is_g2, is_web, q, batch_size, "us", strict_flag, f"Global {src_label}"))
+
+    def _exec_task(t):
+        name, cap, req_doms, is_g2, is_web, q, batch_size, gl_use, strict_flag, src_label = t
+        with state_lock:
+            if len(evidence[name]) >= cap:
+                return None
             telemetry[name]["queries_run"] += 1
-            hits = run_web_query(q, batch_size, include_domains=req_doms, gl_override=gl_low, page=1)
+        hits = run_web_query(q, batch_size, include_domains=req_doms, gl_override=gl_use, page=1)
+        if hits:
             ingest(
                 name,
                 hits,
@@ -878,19 +902,15 @@ def collect_live_mentions_novastacks_scale(
                 exact_brand_only=is_g2,
                 match_source=src_label,
             )
+        return True
 
-            # For Reddit & Quora, also query US global index on the top 6 variants if below 70% of cap
-            if name in ("Reddit", "Quora") and gl_low != "us" and idx < 6 and len(evidence[name]) < int(cap * 0.7):
-                telemetry[name]["queries_run"] += 1
-                us_hits = run_web_query(q, batch_size, include_domains=req_doms, gl_override="us", page=1)
-                ingest(
-                    name,
-                    us_hits,
-                    cap,
-                    required_domains=req_doms,
-                    strict_relevance=strict_flag,
-                    match_source=f"Global {src_label}",
-                )
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = [pool.submit(_exec_task, t) for t in tasks]
+        for fut in as_completed(futures):
+            try:
+                fut.result()
+            except Exception:
+                pass
 
     # 2. News (50 target)
     if serper_key:
@@ -906,7 +926,7 @@ def collect_live_mentions_novastacks_scale(
             diag["errors"].append(f"Serper News: {str(e)[:120]}")
     else:
         try:
-            with DDGS() as ddgs:
+            with DDGS(timeout=8) as ddgs:
                 telemetry["News"]["queries_run"] += 1
                 ingest("News", list(ddgs.news(clean_brand, region=ddg_region, max_results=30)), 50, strict_relevance=False)
                 if len(evidence["News"]) < 50 and clean_cat.lower() != clean_brand.lower():
@@ -918,7 +938,7 @@ def collect_live_mentions_novastacks_scale(
             telemetry["News"]["queries_run"] += 1
             ingest("News", search_google_news_rss(clean_brand, gl=gl_up, max_res=30), 50, strict_relevance=False)
 
-    if len(evidence["Web"]) == 0 and not serper_key and not tavily_key:
+    if len(evidence["Web"]) == 0 and not has_paid_search:
         rss_web = search_google_news_rss(f"{clean_brand} OR {clean_cat}", gl=gl_up, max_res=30)
         ingest("Web", rss_web, 40, exclude_own_domain=True, strict_relevance=True)
 
@@ -1263,7 +1283,7 @@ if run_btn:
         if crawl_data.get("crawl_blocked"):
             st.write(f"ℹ️ Site WAF blocked direct scrape ({crawl_data.get('crawl_note')}); using AI domain entity resolution.")
 
-        st.write("2/3 Harvesting multi-variant Reddit, Quora, News, Web & Social threads + Domain Authority...")
+        st.write("2/3 Harvesting parallel Reddit, Quora, News, Web & Social threads + Domain Authority...")
         client = genai.Client(api_key=api_key)
         try:
             report = run_brand_intelligence_pipeline(
