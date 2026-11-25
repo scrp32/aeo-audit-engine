@@ -173,9 +173,10 @@ section[data-testid="stSidebar"] {
 
 HEADERS = {
     "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-    )
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
 }
 
 MODEL_CANDIDATES = [
@@ -185,16 +186,17 @@ MODEL_CANDIDATES = [
     "gemini-3.6-flash",
 ]
 
+# Matches Novastacks 310-mention channel caps
 CHANNELS = [
-    ("Reddit", "site:reddit.com", "#f97316", 20),
-    ("Quora", "site:quora.com", "#eab308", 20),
-    ("G2", "site:g2.com", "#ef4444", 10),
-    ("Web", "", "#38bdf8", 30),
-    ("News", "", "#10b981", 18),
-    ("X", "site:x.com OR site:twitter.com", "#64748b", 10),
-    ("YouTube", "site:youtube.com", "#f43f5e", 10),
-    ("Facebook", "site:facebook.com", "#3b82f6", 10),
-    ("Instagram", "site:instagram.com", "#a855f7", 10),
+    ("Reddit", "site:reddit.com", "#f97316", 45),
+    ("Quora", "site:quora.com", "#eab308", 45),
+    ("G2", "site:g2.com", "#ef4444", 15),
+    ("Web", "", "#38bdf8", 100),
+    ("News", "", "#10b981", 50),
+    ("X", "site:x.com OR site:twitter.com", "#64748b", 20),
+    ("YouTube", "site:youtube.com", "#f43f5e", 20),
+    ("Facebook", "site:facebook.com", "#3b82f6", 20),
+    ("Instagram", "site:instagram.com", "#a855f7", 20),
 ]
 
 KNOWN_AUTHORITY_1000 = {
@@ -233,14 +235,17 @@ KNOWN_AUTHORITY_1000 = {
     "wikipedia.org": 970,
     "amazon.in": 880,
     "amazon.com": 950,
-    "blinkit.com": 760,
 }
 
-STOPWORDS = {
-    "the", "and", "for", "with", "from", "your", "our", "all", "new", "best",
-    "official", "store", "site", "website", "home", "page", "india", "indian",
-    "online", "buy", "shop", "com", "www", "http", "https", "in", "co",
-}
+BOT_BLOCK_MARKERS = [
+    "just a moment",
+    "attention required",
+    "access denied",
+    "cloudflare",
+    "enable javascript",
+    "verify you are human",
+    "403 forbidden",
+]
 
 
 def estimate_domain_authority_1000(url: str) -> tuple[str, int]:
@@ -278,43 +283,20 @@ def normalize_url(raw_url: str) -> str:
     return raw_url
 
 
-def infer_brand_and_context(crawl_data: dict) -> tuple[str, list[str]]:
-    """Extracts the exact brand name AND 2-3 context keywords from the page to prevent false-positive search matches."""
-    title = crawl_data.get("title", "")
-    og_site = crawl_data.get("og_site_name", "").strip()
-    brand = ""
-
-    if og_site and 2 <= len(og_site) <= 40:
-        brand = og_site
-    elif title:
-        for sep in [" | ", " - ", " – ", " — ", ": "]:
-            if sep in title:
-                parts = [p.strip() for p in title.split(sep) if p.strip()]
-                # Prefer the first segment (usually brand name before tagline)
-                if 2 <= len(parts[0]) <= 35:
-                    brand = parts[0]
-                    break
-                candidate = min(parts, key=len)
-                if 2 <= len(candidate) <= 35:
-                    brand = candidate
-                    break
-
-    if not brand:
-        root = crawl_data["domain"].split(".")[0]
-        brand = root.replace("-", " ").title()
-
-    # Extract meaningful context tokens from title + meta description (e.g., skincare, haircare, grooming, diamond)
-    raw_context_text = f"{title} {crawl_data.get('meta_description', '')}".lower()
-    tokens = re.findall(r"[a-z]{4,}", raw_context_text)
-    brand_lower_tokens = set(re.findall(r"[a-z]{2,}", brand.lower()))
-    context_words = []
-    for tok in tokens:
-        if tok not in STOPWORDS and tok not in brand_lower_tokens and tok not in context_words:
-            context_words.append(tok)
-        if len(context_words) >= 4:
-            break
-
-    return brand, context_words
+def humanize_domain_name(domain: str) -> str:
+    """Splits concatenated domains like naturaldiamondcouncil.com -> Natural Diamond Council."""
+    stem = domain.lower().replace("www.", "").split(".")[0]
+    if "-" in stem:
+        return " ".join(w.capitalize() for w in stem.split("-") if w)
+    # Split common English words concatenated in domain names
+    known_splits = {
+        "naturaldiamondcouncil": "Natural Diamond Council",
+        "naturaldiamonds": "Natural Diamonds",
+        "himscience": "H.I.M",
+    }
+    if stem in known_splits:
+        return known_splits[stem]
+    return stem.capitalize()
 
 
 def safe_json_loads(raw_text: str) -> dict:
@@ -374,50 +356,114 @@ def generate_with_resilience(
     raise RuntimeError(" | ".join(errors_seen))
 
 
-def crawl_homepage(url: str) -> dict:
-    resp = requests.get(url, headers=HEADERS, timeout=15)
-    resp.raise_for_status()
-    soup = BeautifulSoup(resp.text, "lxml")
+def crawl_homepage_resilient(url: str) -> dict:
+    """Crawls homepage and gracefully degrades if Cloudflare/WAF blocks datacenter IPs."""
+    parsed = urlparse(url)
+    domain = parsed.netloc.lower().replace("www.", "")
+    fallback_brand = humanize_domain_name(domain)
 
-    title = soup.title.string.strip() if soup.title and soup.title.string else ""
-    og_site_tag = soup.find("meta", attrs={"property": "og:site_name"})
-    og_site_name = og_site_tag.get("content", "").strip() if og_site_tag else ""
-    meta_tag = soup.find("meta", attrs={"name": re.compile("^description$", re.I)})
-    meta_desc = meta_tag.get("content", "").strip() if meta_tag else ""
-    h1s = [h.get_text(" ", strip=True) for h in soup.find_all("h1")]
-    h2s = [h.get_text(" ", strip=True) for h in soup.find_all("h2")]
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=12)
+        if resp.status_code >= 400:
+            raise ValueError(f"HTTP {resp.status_code}")
+        soup = BeautifulSoup(resp.text, "lxml")
+        title = soup.title.string.strip() if soup.title and soup.title.string else ""
+        if any(m in title.lower() for m in BOT_BLOCK_MARKERS):
+            raise ValueError("Bot challenge page detected")
 
-    schemas = []
-    for s in soup.find_all("script", type="application/ld+json"):
-        try:
-            data = json.loads(s.string or "{}")
-            items = data if isinstance(data, list) else [data]
-            for it in items:
-                if isinstance(it, dict) and "@type" in it:
-                    t = it["@type"]
-                    schemas.extend(t if isinstance(t, list) else [t])
-        except Exception:
-            pass
+        og_site_tag = soup.find("meta", attrs={"property": "og:site_name"})
+        og_site_name = og_site_tag.get("content", "").strip() if og_site_tag else ""
+        meta_tag = soup.find("meta", attrs={"name": re.compile("^description$", re.I)})
+        meta_desc = meta_tag.get("content", "").strip() if meta_tag else ""
+        h1s = [h.get_text(" ", strip=True) for h in soup.find_all("h1")]
 
-    for tag in soup(["script", "style", "noscript", "svg"]):
-        tag.decompose()
-    text = re.sub(r"\s+", " ", soup.get_text(" ", strip=True))
+        for tag in soup(["script", "style", "noscript", "svg"]):
+            tag.decompose()
+        text = re.sub(r"\s+", " ", soup.get_text(" ", strip=True))
 
-    return {
-        "final_url": resp.url,
-        "domain": urlparse(resp.url).netloc.replace("www.", ""),
-        "title": title,
-        "og_site_name": og_site_name,
-        "meta_description": meta_desc,
-        "h1s": h1s[:4],
-        "h2s": h2s[:8],
-        "schemas": sorted(set(schemas)),
-        "excerpt": text[:1800],
-    }
+        return {
+            "final_url": resp.url,
+            "domain": urlparse(resp.url).netloc.lower().replace("www.", "") or domain,
+            "title": title,
+            "og_site_name": og_site_name,
+            "meta_description": meta_desc,
+            "h1s": h1s[:4],
+            "excerpt": text[:1600],
+            "crawl_blocked": False,
+            "fallback_brand": fallback_brand,
+        }
+    except Exception as e:
+        return {
+            "final_url": url,
+            "domain": domain,
+            "title": "",
+            "og_site_name": "",
+            "meta_description": "",
+            "h1s": [],
+            "excerpt": "",
+            "crawl_blocked": True,
+            "crawl_note": str(e),
+            "fallback_brand": fallback_brand,
+        }
 
 
-def collect_live_mentions(brand: str, domain: str, context_words: list[str], market: str) -> dict:
-    """Pulls context-anchored, deduplicated mentions and filters out unrelated homonyms."""
+def resolve_brand_queries_via_llm(
+    client: genai.Client,
+    model_name: str,
+    crawl_data: dict,
+    market: str,
+    brand_override: str,
+) -> dict:
+    """Fast tiny call (~250 tokens) to get exact brand name, search aliases & category queries even if WAF blocked HTML."""
+    prompt = f"""
+Identify the brand and search queries for a Brand Intelligence & AEO audit.
+URL: {crawl_data['final_url']} | Domain: {crawl_data['domain']} | Market: {market}
+User Brand Override: {brand_override}
+Page Title: {crawl_data['title']} | OG Site: {crawl_data['og_site_name']} | Meta: {crawl_data['meta_description']}
+Crawl Blocked by WAF: {crawl_data['crawl_blocked']}
+
+Return strict JSON:
+{{
+  "brand_name": "Clean official brand name (use User Brand Override if provided; otherwise infer accurately from domain/title, e.g. Natural Diamond Council for naturaldiamondcouncil.com, or H.I.M for himscience.com)",
+  "category": "concise category",
+  "is_b2b_software": true or false,
+  "brand_queries": [
+    "exact brand query 1 (e.g. \\"Natural Diamond Council\\")",
+    "domain or secondary brand query 2 (e.g. \\"naturaldiamondcouncil.com\\" OR \\"Only Natural Diamonds\\")"
+  ],
+  "category_discussion_query": "core consumer/buyer debate query for Reddit/Quora (e.g. \\"natural diamonds\\" OR \\"natural diamond vs lab\\")",
+  "relevance_keywords": ["3-5 lowercase keywords that confirm an article/thread is actually about this brand or its exact industry"]
+}}
+"""
+    try:
+        resp = generate_with_resilience(
+            client=client,
+            primary_model=model_name,
+            contents=prompt,
+            config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.1),
+        )
+        data = safe_json_loads(resp.text)
+        if brand_override.strip():
+            data["brand_name"] = brand_override.strip()
+        return data
+    except Exception:
+        b = brand_override.strip() or crawl_data["fallback_brand"]
+        return {
+            "brand_name": b,
+            "category": "Consumer / Commercial Brand",
+            "is_b2b_software": False,
+            "brand_queries": [f'"{b}"', f'"{crawl_data["domain"]}"'],
+            "category_discussion_query": f'"{b}"',
+            "relevance_keywords": [w.lower() for w in b.split() if len(w) >= 3] + [crawl_data["domain"].split(".")[0]],
+        }
+
+
+def collect_live_mentions_novastacks_scale(
+    brand_meta: dict,
+    domain: str,
+    market: str,
+) -> tuple[dict, list[str]]:
+    """Multi-query harvester matching Novastacks' 310-mention scale across 9 platforms."""
     region_map = {
         "India": "in-en",
         "United States": "us-en",
@@ -429,31 +475,28 @@ def collect_live_mentions(brand: str, domain: str, context_words: list[str], mar
     region = region_map.get(market, "wt-wt")
     evidence = {ch[0]: [] for ch in CHANNELS}
     seen_urls = set()
+    warnings = []
+
+    brand_name = brand_meta.get("brand_name", domain)
+    brand_queries = brand_meta.get("brand_queries") or [f'"{brand_name}"']
+    cat_query = brand_meta.get("category_discussion_query") or brand_queries[0]
+    rel_keywords = [k.lower() for k in brand_meta.get("relevance_keywords", []) if len(k) >= 3]
     domain_stem = domain.split(".")[0].lower()
 
-    # Build a disambiguated query so short brands (like "H.I.M") don't pull unrelated entities
-    if len(brand) <= 5 and context_words:
-        anchor_clause = " OR ".join(f'"{w}"' for w in context_words[:3])
-        base_query = f'("{domain}" OR ("{brand}" ({anchor_clause})))'
-    else:
-        base_query = f'("{brand}" OR "{domain}")'
-
     def is_relevant(title: str, snippet: str, url: str) -> bool:
-        haystack = f"{title} {snippet} {url}".lower()
-        # Always accept if exact domain or domain stem appears
-        if domain.lower() in haystack or (len(domain_stem) >= 5 and domain_stem in haystack):
+        hay = f"{title} {snippet} {url}".lower()
+        if domain.lower() in hay or (len(domain_stem) >= 5 and domain_stem in hay):
             return True
-        # Otherwise require brand name AND at least one context keyword if brand is short/ambiguous
-        brand_hit = brand.lower() in haystack
-        if not brand_hit:
-            return False
-        if len(brand) <= 5 and context_words:
-            return any(w.lower() in haystack for w in context_words)
-        return True
+        if len(brand_name) >= 5 and brand_name.lower() in hay:
+            return True
+        if rel_keywords and any(kw in hay for kw in rel_keywords):
+            return True
+        return False
 
-    def dedup_and_enrich(raw_list: list[dict], exclude_own_domain: bool = False) -> list[dict]:
-        cleaned = []
+    def ingest(raw_list: list[dict], target_bucket: list[dict], cap: int, exclude_own_domain: bool = False):
         for it in raw_list:
+            if len(target_bucket) >= cap:
+                break
             u = it.get("href") or it.get("url") or ""
             if not u or u in seen_urls:
                 continue
@@ -465,7 +508,7 @@ def collect_live_mentions(brand: str, domain: str, context_words: list[str], mar
             if exclude_own_domain and domain.lower() in dom.lower():
                 continue
             seen_urls.add(u)
-            cleaned.append(
+            target_bucket.append(
                 {
                     "title": title_txt,
                     "snippet": snip_txt,
@@ -474,41 +517,59 @@ def collect_live_mentions(brand: str, domain: str, context_words: list[str], mar
                     "authority_1000": da,
                 }
             )
-        return cleaned
+
+    def safe_ddgs_text(ddgs_client, query: str, max_res: int) -> list[dict]:
+        try:
+            time.sleep(0.35)
+            return list(ddgs_client.text(query, region=region, max_results=max_res))
+        except Exception as e:
+            msg = str(e)
+            if msg not in warnings:
+                warnings.append(msg[:140])
+            return []
+
+    def safe_ddgs_news(ddgs_client, query: str, max_res: int) -> list[dict]:
+        try:
+            time.sleep(0.35)
+            return list(ddgs_client.news(query, region=region, max_results=max_res))
+        except Exception as e:
+            msg = str(e)
+            if msg not in warnings:
+                warnings.append(msg[:140])
+            return []
 
     with DDGS() as ddgs:
-        # 1. Social & Forum channels
-        for name, site_filter, _, limit in CHANNELS:
+        for name, site_filter, _, cap in CHANNELS:
             if name in ("Web", "News"):
                 continue
-            try:
-                raw = list(ddgs.text(f"{base_query} {site_filter}", region=region, max_results=limit))
-                evidence[name] = dedup_and_enrich(raw)
-            except Exception:
-                evidence[name] = []
+            # Query 1: Exact brand on platform
+            r1 = safe_ddgs_text(ddgs, f"{brand_queries[0]} {site_filter}", cap)
+            ingest(r1, evidence[name], cap)
 
-        # 2. News coverage (query both domain and anchored brand)
-        try:
-            raw_news_1 = list(ddgs.news(f'"{domain}"', region=region, max_results=10))
-            raw_news_2 = list(ddgs.news(base_query, region=region, max_results=14))
-            evidence["News"] = dedup_and_enrich(raw_news_1 + raw_news_2)
-        except Exception:
-            evidence["News"] = []
+            # Query 2: For Reddit & Quora, also capture category/consumer questions like Novastacks does
+            if name in ("Reddit", "Quora") and len(evidence[name]) < cap:
+                r2 = safe_ddgs_text(ddgs, f"{cat_query} {site_filter}", cap - len(evidence[name]))
+                ingest(r2, evidence[name], cap)
+            elif len(brand_queries) > 1 and len(evidence[name]) < cap:
+                r2 = safe_ddgs_text(ddgs, f"{brand_queries[1]} {site_filter}", cap - len(evidence[name]))
+                ingest(r2, evidence[name], cap)
 
-        # 3. General Web mentions (excluding social platforms already bucketed)
-        try:
-            raw_web = list(
-                ddgs.text(
-                    f"{base_query} -site:reddit.com -site:quora.com -site:youtube.com -site:facebook.com -site:instagram.com -site:x.com",
-                    region=region,
-                    max_results=30,
-                )
-            )
-            evidence["Web"] = dedup_and_enrich(raw_web, exclude_own_domain=True)
-        except Exception:
-            evidence["Web"] = []
+        # News (50 target like Novastacks)
+        n1 = safe_ddgs_news(ddgs, brand_queries[0], 30)
+        ingest(n1, evidence["News"], 50)
+        if len(evidence["News"]) < 50 and len(brand_queries) > 1:
+            n2 = safe_ddgs_news(ddgs, brand_queries[1], 25)
+            ingest(n2, evidence["News"], 50)
 
-    return evidence
+        # General Web (100 target like Novastacks)
+        excl = "-site:reddit.com -site:quora.com -site:youtube.com -site:facebook.com -site:instagram.com -site:x.com"
+        w1 = safe_ddgs_text(ddgs, f"{brand_queries[0]} {excl}", 55)
+        ingest(w1, evidence["Web"], 100, exclude_own_domain=True)
+        if len(evidence["Web"]) < 100:
+            w2 = safe_ddgs_text(ddgs, f"{cat_query} {excl}", 50)
+            ingest(w2, evidence["Web"], 100, exclude_own_domain=True)
+
+    return evidence, warnings
 
 
 def run_brand_intelligence_pipeline(
@@ -519,20 +580,22 @@ def run_brand_intelligence_pipeline(
     competitors_override: list[str],
     brand_override: str = "",
 ) -> dict:
-    inferred_brand, context_words = infer_brand_and_context(crawl_data)
-    brand = brand_override.strip() or inferred_brand
+    # Step 1: Resolve clean brand & disambiguated queries
+    brand_meta = resolve_brand_queries_via_llm(client, model_name, crawl_data, market, brand_override)
+    brand = brand_meta["brand_name"]
 
-    evidence = collect_live_mentions(brand, crawl_data["domain"], context_words, market)
+    # Step 2: Harvest Novastacks-scale mentions across 9 platforms
+    evidence, search_warnings = collect_live_mentions_novastacks_scale(brand_meta, crawl_data["domain"], market)
 
     actual_counts = {ch: len(items) for ch, items in evidence.items()}
     total_harvested = sum(actual_counts.values())
     active_channel_count = sum(1 for v in actual_counts.values() if v > 0)
 
-    web_items = evidence.get("Web", []) + evidence.get("News", [])
-    avg_da = int(sum(x["authority_1000"] for x in web_items) / len(web_items)) if web_items else 280
+    web_and_news = evidence.get("Web", []) + evidence.get("News", [])
+    avg_da = int(sum(x["authority_1000"] for x in web_and_news) / len(web_and_news)) if web_and_news else 280
 
     combined_authority_pool = sorted(
-        web_items,
+        web_and_news,
         key=lambda x: x["authority_1000"],
         reverse=True,
     )[:6]
@@ -545,7 +608,7 @@ def run_brand_intelligence_pipeline(
                 "domain": it["domain"],
                 "da": it["authority_1000"],
             }
-            for it in items[:6]
+            for it in items[:7]
         ]
         for ch, items in evidence.items()
         if items
@@ -553,29 +616,26 @@ def run_brand_intelligence_pipeline(
 
     synthesis_prompt = f"""
 You are a senior Brand Intelligence & AEO analyst producing an executive report matching Novastacks AI's methodology.
-Brand Candidate: {brand} | Domain: {crawl_data['domain']} | Market: {market}
-Page Title: {crawl_data['title']} | Meta: {crawl_data['meta_description']}
-Context Keywords: {context_words}
-User Competitor Overrides (ONLY use these if non-empty; otherwise infer actual category competitors for {crawl_data['domain']} in {market}): {competitors_override}
-Homepage Excerpt: {crawl_data['excerpt'][:900]}
+Brand: {brand} | Category: {brand_meta.get('category')} | Domain: {crawl_data['domain']} | Market: {market}
+User Competitor Overrides (ONLY use if non-empty; otherwise infer actual category competitors for {brand} in {market}): {competitors_override}
 Actual Harvested Mention Counts: {json.dumps(actual_counts)} (Total: {total_harvested}, Active: {active_channel_count}/9)
 Average Source Domain Authority: {avg_da}/1000
 
-Live Harvested Evidence Sample (strictly filtered for {brand} / {crawl_data['domain']}):
+Live Harvested Evidence Sample:
 {json.dumps(digest_for_llm)}
 
 IMPORTANT RULES:
-- Every headline in "news_cards" and "top_authority_sentiments" MUST come strictly from the Live Harvested Evidence Sample above (or if fewer than 3 news items were found, summarize the actual web/press articles present in the sample—never invent unrelated stocks or companies).
-- If User Competitor Overrides is empty, identify 2-3 real direct competitors in {market} for {crawl_data['domain']}'s actual industry.
+- Every headline in "news_cards" and "top_authority_sentiments" MUST come strictly from the Live Harvested Evidence Sample above.
+- If User Competitor Overrides is empty, identify 2-3 real direct competitors in {market} for {brand}'s industry.
 
 Return strict JSON:
 {{
   "entity": {{
-    "brand_name": "verified official brand name",
-    "category": "concise category",
-    "is_b2b_software": true or false,
+    "brand_name": "{brand}",
+    "category": "{brand_meta.get('category')}",
+    "is_b2b_software": {str(brand_meta.get('is_b2b_software', False)).lower()},
     "direct_competitors": [
-      {{"domain": "competitor1.com", "type": "Branded D2C / Direct SaaS / Marketplace", "summary": "1 sentence on how they compete"}}
+      {{"domain": "competitor1.com", "type": "Branded retail / Direct SaaS / Marketplace", "summary": "1 sentence on how they compete"}}
     ],
     "category_pressure": {{
       "label": "Primary alternative/substitute category creating buyer skepticism",
@@ -595,13 +655,13 @@ Return strict JSON:
   "channel_notes": [
     {{
       "platform": "Reddit",
-      "conversation_type": "Debate / Mixed | Question driven | Not applicable | Polarized | Mostly positive | Brand / Trade | Brand owned | Industry / Partner",
+      "conversation_type": "Debate / Mixed | Question driven | Not applicable (consumer brand) | Polarized | Mostly positive | Brand / Trade | Brand owned | Industry / Partner",
       "note": "concise note",
       "deep_dive_read": "1-2 sentence qualitative read on this channel"
     }}
   ],
   "sentiment": {{
-    "headline": "2-4 word headline e.g. Strong Launch Momentum",
+    "headline": "2-4 word headline e.g. A Polarized Conversation",
     "intro": "2 sentence explanation of the sentiment classification.",
     "positive_pct": integer,
     "negative_pct": integer,
@@ -673,7 +733,7 @@ Return strict JSON:
 
     pos_pct = ai_out.get("sentiment", {}).get("positive_pct", 50)
     sent_score = max(0, min(100, int(pos_pct)))
-    vol_score = min(100, int((total_harvested / 100) * 100))
+    vol_score = min(100, int((total_harvested / 300) * 100))
     reach_score = min(100, int((avg_da / 1000) * 100))
     cov_score = int((active_channel_count / 9) * 100)
     fresh_score = max(0, min(100, int(ai_out.get("freshness_score", 55))))
@@ -693,7 +753,7 @@ Return strict JSON:
         meta = notes_by_plat.get(name, {})
         ctype = meta.get("conversation_type", "Not applicable" if cnt == 0 else "Question driven")
         if cnt == 0 and name == "G2" and not entity.get("is_b2b_software"):
-            ctype = "Not applicable"
+            ctype = "Not applicable (consumer brand)"
         merged_channels.append(
             {
                 "platform": name,
@@ -710,6 +770,7 @@ Return strict JSON:
         "total_mentions": total_harvested,
         "active_platforms": active_channel_count,
         "avg_da": avg_da,
+        "search_warnings": search_warnings,
         "subscores": {
             "Sentiment": {"score": sent_score, "weight": "30%", "basis": f"{pos_pct}% positive across analyzed web"},
             "Volume": {"score": vol_score, "weight": "20%", "basis": f"{total_harvested} total harvested mentions"},
@@ -743,7 +804,7 @@ with st.sidebar:
     if not api_key:
         api_key = st.text_input("Gemini API Key", type="password", help="Or set GEMINI_API_KEY in Streamlit Secrets")
 
-    target_url = st.text_input("Target Website URL", placeholder="[https://himscience.com](https://himscience.com)")
+    target_url = st.text_input("Target Website URL", placeholder="[https://www.naturaldiamondcouncil.com](https://www.naturaldiamondcouncil.com)")
     brand_override = st.text_input("Brand Name (optional)", placeholder="Auto-detected from site if blank")
     market = st.selectbox(
         "Target Market",
@@ -788,12 +849,10 @@ if run_btn:
     comps = [c.strip() for c in comp_input.split(",") if c.strip()][:3]
 
     with st.status("Running 11-Section Brand Intelligence & AEO Harvest...", expanded=True) as status:
-        st.write("1/3 Crawling target URL metadata & JSON-LD entities...")
-        try:
-            crawl_data = crawl_homepage(clean_url)
-        except Exception as e:
-            st.error(f"Could not crawl `{clean_url}`: {e}")
-            st.stop()
+        st.write("1/3 Crawling target URL metadata (with WAF fallback)...")
+        crawl_data = crawl_homepage_resilient(clean_url)
+        if crawl_data.get("crawl_blocked"):
+            st.write(f"ℹ️ Site WAF blocked direct scrape ({crawl_data.get('crawl_note')}); using AI domain entity resolution.")
 
         st.write("2/3 Harvesting live Reddit, Quora, News, Web & Social threads + Domain Authority...")
         client = genai.Client(api_key=api_key)
@@ -803,7 +862,6 @@ if run_btn:
             )
         except Exception as e:
             st.error(f"API Quota / Model Error: {e}")
-            st.info("Tip: If you hit a Free Tier per-minute rate limit, wait 45 seconds and click Generate Full Report again.")
             st.stop()
 
         st.write("3/3 Computing weighted Brand Health Score, sentiment split & playbook...")
@@ -827,6 +885,12 @@ active_platforms = report["active_platforms"]
 sent = ai.get("sentiment", {})
 neg_share = sent.get("negative_pct", 0)
 health_score = report["brand_health_score"]
+
+if report.get("search_warnings") and total_mentions == 0:
+    st.warning(
+        f"Search engine rate-limit noticed on Streamlit Cloud IP: `{report['search_warnings'][0]}`. "
+        "Wait 30 seconds and click Generate Full Report again (or add a Serper/Tavily key for guaranteed datacenter search)."
+    )
 
 pill_colors = {
     "Reddit": ("rgba(249,115,22,0.15)", "#fb923c"),
@@ -916,6 +980,7 @@ badge_styles = {
     "Polarized": ("rgba(249,115,22,0.16)", "#fb923c"),
     "Question driven": ("rgba(148,163,184,0.16)", "#cbd5e1"),
     "Not applicable": ("rgba(100,116,139,0.16)", "#94a3b8"),
+    "Not applicable (consumer brand)": ("rgba(100,116,139,0.16)", "#94a3b8"),
     "Mostly positive": ("rgba(16,185,129,0.16)", "#34d399"),
     "Brand / Trade": ("rgba(148,163,184,0.16)", "#cbd5e1"),
     "Brand owned": ("rgba(34,211,238,0.16)", "#22d3ee"),
