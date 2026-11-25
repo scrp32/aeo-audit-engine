@@ -1,7 +1,6 @@
 import json
 import re
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urljoin, urlparse
 
 import pandas as pd
@@ -38,10 +37,12 @@ RECOMMENDED_SCHEMAS = {
     "HowTo",
 }
 
+# Models available on the Gemini API Free Tier (with separate per-model quotas)
 MODEL_CANDIDATES = [
+    "gemini-4-hydrogen",
     "gemini-3.8-flash",
-    "gemini-3-flash-preview",
     "gemini-3.6-flash",
+    "gemini-3.5-flash-lite",
 ]
 
 
@@ -53,7 +54,6 @@ def normalize_url(raw_url: str) -> str:
 
 
 def safe_json_loads(raw_text: str) -> dict:
-    """Strips optional markdown code fences before parsing JSON."""
     cleaned = raw_text.strip()
     if cleaned.startswith("```"):
         cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
@@ -66,14 +66,13 @@ def generate_with_resilience(
     primary_model: str,
     contents: str,
     config: types.GenerateContentConfig,
-    max_retries: int = 3,
 ):
-    """Retries on 503/429 high-demand spikes and falls back across Flash models."""
+    """Tries primary model, waits briefly on 503, and switches model immediately on 404/429."""
     ordered_models = [primary_model] + [m for m in MODEL_CANDIDATES if m != primary_model]
     last_err = None
 
     for model_id in ordered_models:
-        for attempt in range(max_retries):
+        for attempt in range(2):
             try:
                 return client.models.generate_content(
                     model=model_id,
@@ -83,16 +82,20 @@ def generate_with_resilience(
             except Exception as err:
                 last_err = err
                 err_str = str(err).upper()
-                # If model ID is invalid/not found, immediately try next fallback model
-                if "404" in err_str or "NOT_FOUND" in err_str:
+                # Immediately switch to next model if quota (429) or not found (404)
+                if any(k in err_str for k in ["404", "NOT_FOUND", "429", "RESOURCE_EXHAUSTED"]):
                     break
-                # Retry transient 503/429 capacity errors with backoff
-                if any(code in err_str for code in ["503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED"]):
-                    time.sleep(2 ** (attempt + 1))
+                # Brief backoff only for transient 503 overload
+                if "503" in err_str or "UNAVAILABLE" in err_str:
+                    time.sleep(2 * (attempt + 1))
                     continue
                 raise err
 
-    raise RuntimeError(f"All fallback Gemini models returned errors. Last error: {last_err}")
+    raise RuntimeError(
+        f"Gemini API quota/availability error across fallback models ({', '.join(ordered_models)}). "
+        f"If 'Live Google Search Grounding' is checked, uncheck it in the sidebar (requires a paid Tier 1 key) "
+        f"or wait 60 seconds for per-minute quota reset. Details: {last_err}"
+    )
 
 
 def check_robots_and_llms(base_url: str) -> dict:
@@ -201,24 +204,20 @@ def crawl_site(url: str) -> dict:
     score = 0
     breakdown = {}
 
-    # 1. AI Crawler Access (25 pts)
     allowed_count = sum(1 for v in bots_and_llms["bot_status"].values() if "Allowed" in v)
     crawler_pts = int((allowed_count / len(AI_BOTS)) * 20) + (5 if bots_and_llms["llms_txt_found"] else 0)
     score += crawler_pts
     breakdown["AI Crawler & llms.txt Access"] = f"{crawler_pts}/25"
 
-    # 2. Structured Data / Schema (25 pts)
     schema_pts = min(25, len(schemas) * 8 + (5 if "FAQPage" in schemas else 0))
     score += schema_pts
     breakdown["Schema & Entity Markup"] = f"{schema_pts}/25"
 
-    # 3. Question-Answer & Extractable Structure (30 pts)
     qa_pts = min(15, len(question_headings) * 5)
     struct_pts = (8 if has_semantic_tags else 0) + (7 if has_tables_or_lists else 0)
     score += qa_pts + struct_pts
     breakdown["Q&A Coverage & Extractable Formatting"] = f"{qa_pts + struct_pts}/30"
 
-    # 4. Core Entity Clarity & Content Depth (20 pts)
     entity_pts = (
         (5 if title else 0)
         + (5 if len(meta_desc) >= 60 else 0)
@@ -242,68 +241,20 @@ def crawl_site(url: str) -> dict:
         "bots_and_llms": bots_and_llms,
         "readiness_score": score,
         "score_breakdown": breakdown,
-        "body_excerpt": body_text[:4500],
-    }
-
-
-def evaluate_single_prompt(
-    client: genai.Client,
-    model_name: str,
-    search_tool: types.Tool,
-    bp: str,
-    market: str,
-    brand: str,
-    domain: str,
-    competitors: list[str],
-) -> dict:
-    live_resp = generate_with_resilience(
-        client=client,
-        primary_model=model_name,
-        contents=(
-            f"Answer this user query thoroughly for someone in {market}, "
-            f"recommending specific brands, platforms, or providers where relevant:\n\n{bp}"
-        ),
-        config=types.GenerateContentConfig(
-            tools=[search_tool],
-            temperature=0.3,
-        ),
-    )
-    ans_text = live_resp.text or ""
-
-    cited_urls = []
-    cand = live_resp.candidates[0] if live_resp.candidates else None
-    if cand and cand.grounding_metadata and cand.grounding_metadata.grounding_chunks:
-        for chunk in cand.grounding_metadata.grounding_chunks:
-            if chunk.web and chunk.web.uri:
-                cited_urls.append(chunk.web.uri)
-
-    mentioned = brand.lower() in ans_text.lower() or domain.lower() in ans_text.lower()
-    cited = any(domain.lower() in u.lower() for u in cited_urls) or (domain.lower() in ans_text.lower())
-    comp_hits = [c for c in competitors if c.lower() in ans_text.lower()]
-
-    return {
-        "Prompt": bp,
-        "Brand Mentioned": "✅ Yes" if mentioned else "❌ No",
-        "Domain Cited": "✅ Yes" if cited else "❌ No",
-        "Competitors Recommended": ", ".join(comp_hits) if comp_hits else "None / Other brands",
-        "AI Answer Snippet": ans_text[:450] + ("..." if len(ans_text) > 450 else ""),
-        "Grounded Sources": cited_urls[:5],
-        "_mentioned_bool": mentioned,
-        "_cited_bool": cited,
+        "body_excerpt": body_text[:4000],
     }
 
 
 def run_llm_and_serp_audit(
     client: genai.Client,
     model_name: str,
+    use_search_grounding: bool,
     crawl_data: dict,
     market: str,
     competitors_override: list[str],
     concern: str,
 ) -> dict:
-    search_tool = types.Tool(google_search=types.GoogleSearch())
-
-    # Step 1: Extract Brand Entity, Category, Competitors & Buyer Prompts
+    # Call 1: Entity, Competitors & Test Plan (No search tool needed -> fast & quota-light)
     discovery_prompt = f"""
 Analyze this crawled webpage and generate an AEO test plan for target market: {market}.
 Domain: {crawl_data['domain']}
@@ -320,7 +271,7 @@ Return strict JSON with keys:
 - "brand_name": string
 - "category": string (concise category description)
 - "competitors": list of 2 direct competitor brand names in {market}
-- "buyer_prompts": list of 5 realistic unbranded buyer-intent search/AI prompts a prospect in {market} would ask ChatGPT/Gemini when looking for this solution (do NOT include the brand name in these prompts)
+- "buyer_prompts": list of 5 realistic unbranded buyer-intent prompts a prospect in {market} would ask ChatGPT/Gemini when looking for this solution (do NOT include the brand name)
 - "core_keywords": list of 4 core commercial/informational Google search keywords for this business in {market}
 """
     plan_resp = generate_with_resilience(
@@ -339,75 +290,95 @@ Return strict JSON with keys:
     competitors = plan["competitors"][:2]
     buyer_prompts = plan["buyer_prompts"][:5]
 
-    # Step 2: Execute Live Google-Search-Grounded Queries concurrently
-    prompt_results_map = {}
-    with ThreadPoolExecutor(max_workers=3) as pool:
-        futures = {
-            pool.submit(
-                evaluate_single_prompt,
-                client,
-                model_name,
-                search_tool,
-                bp,
-                market,
-                brand,
-                domain,
-                competitors,
-            ): idx
-            for idx, bp in enumerate(buyer_prompts)
-        }
-        for future in as_completed(futures):
-            idx = futures[future]
-            prompt_results_map[idx] = future.result()
+    # Call 2: Single Consolidated Visibility + Competitive + SERP + Opportunities Assessment
+    # (Uses 1 API call instead of 6 so it never trips Free Tier RPM limits)
+    tools_list = [types.Tool(google_search=types.GoogleSearch())] if use_search_grounding else None
 
-    prompt_results = [prompt_results_map[i] for i in range(len(buyer_prompts))]
-    brand_mentions = sum(1 for r in prompt_results if r.pop("_mentioned_bool"))
-    brand_citations = sum(1 for r in prompt_results if r.pop("_cited_bool"))
-
-    # Step 3: Grounded SERP + Competitive Snapshot + Top 3 Opportunities
-    synthesis_prompt = f"""
-You are a senior Answer Engine Optimization (AEO) & Generative Engine Optimization (GEO) strategist.
-Using live Google Search, assess {brand} ({domain}) vs competitors {competitors} in {market}.
+    audit_prompt = f"""
+You are a senior Answer Engine Optimization (AEO) & Generative Engine Optimization (GEO) auditor.
+Evaluate {brand} ({domain}) vs competitors {competitors} in target market: {market}.
 
 Crawled Technical Data:
 - AEO Readiness Score: {crawl_data['readiness_score']}/100 ({crawl_data['score_breakdown']})
-- Found Schemas: {crawl_data['schemas_found']}
-- Missing Schemas: {crawl_data['schemas_missing']}
-- Crawler & llms.txt Status: {crawl_data['bots_and_llms']}
+- Found JSON-LD Schemas: {crawl_data['schemas_found']}
+- Missing JSON-LD Schemas: {crawl_data['schemas_missing']}
+- AI Crawler & llms.txt Status: {crawl_data['bots_and_llms']}
 - Question Headings Found: {crawl_data['question_headings']}
 
-Live LLM Prompt Test Results ({brand_mentions}/5 mentions, {brand_citations}/5 citations):
-{json.dumps([{k: v for k, v in r.items() if k != 'AI Answer Snippet'} for r in prompt_results], indent=2)}
+Unbranded Buyer Prompts to Evaluate for {market}:
+{json.dumps(buyer_prompts, indent=2)}
 
-Core Keywords to Check on Google Search: {plan['core_keywords']}
+Core Google Search Keywords to Evaluate for {market}:
+{json.dumps(plan['core_keywords'], indent=2)}
 
-Perform live Google searches for the core keywords and brand vs competitors in {market}, then return strict JSON with:
-1. "serp_checks": list of objects for each keyword in {plan['core_keywords']} with keys:
+Return strict JSON with these exact keys:
+1. "prompt_evaluations": list of 5 objects (one for each buyer prompt above) with keys:
+   - "prompt": string (exact prompt text)
+   - "brand_mentioned": boolean (true if {brand} is realistically recommended/mentioned in AI answers today for this unbranded query in {market})
+   - "domain_cited": boolean (true if {domain} is likely cited as a source link)
+   - "competitors_recommended": list of competitor/incumbent brands typically recommended instead
+   - "simulated_ai_answer": string (concise 2-3 sentence realistic AI answer showing how an assistant answers this buyer query today)
+2. "competitive_snapshot": string (markdown comparison of {brand} vs {competitors[0]} and {competitors[1]} across AI entity recognition, third-party citations, review/directory presence, and content authority in {market})
+3. "serp_checks": list of 4 objects (one per core keyword) with keys:
    - "keyword": string
-   - "brand_visibility": string (e.g., "Top 3 Organic", "Page 1 (Pos 4-10)", "Not in Top 10", "Cited in AI Overview")
-   - "ai_overview_risk": string ("High - AI answers query directly", "Medium", "Low")
-   - "dominant_domains": list of top 2-3 domains currently ranking/cited
-2. "competitive_snapshot": markdown summary comparing {brand} against {competitors[0]} and {competitors[1]} on AI visibility, content authority, third-party citations, and organic footprint.
-3. "schema_recommendations": list of 3 specific JSON-LD schema additions tailored to {domain} with exact rationale.
-4. "top_3_opportunities": list of 3 objects, each with "title", "impact" ("High" or "Critical"), "effort" ("Low", "Medium", "High"), and "action_plan" (concrete, non-generic steps tailored to {domain}).
+   - "brand_visibility": string (e.g. "Strong Branded", "Competing on Page 1", "Low / Displaced by Aggregators")
+   - "ai_overview_risk": string ("High - AI answers directly", "Medium", "Low")
+   - "dominant_domains": list of 2-3 domains/platforms dominating this query in {market}
+4. "schema_recommendations": list of 3 specific JSON-LD schema additions tailored to {domain} with exact rationale
+5. "top_3_opportunities": list of 3 objects, each with:
+   - "title": string
+   - "impact": string ("Critical" or "High")
+   - "effort": string ("Low", "Medium", or "High")
+   - "action_plan": string (specific, actionable steps tailored to {domain} and {market})
 """
-    synth_resp = generate_with_resilience(
+    audit_resp = generate_with_resilience(
         client=client,
         primary_model=model_name,
-        contents=synthesis_prompt,
+        contents=audit_prompt,
         config=types.GenerateContentConfig(
-            tools=[search_tool],
+            tools=tools_list,
             response_mime_type="application/json",
             temperature=0.2,
         ),
     )
-    synthesis = safe_json_loads(synth_resp.text)
+    synthesis = safe_json_loads(audit_resp.text)
+
+    # Extract grounded URLs if search grounding was enabled
+    grounded_urls = []
+    cand = audit_resp.candidates[0] if audit_resp.candidates else None
+    if cand and cand.grounding_metadata and cand.grounding_metadata.grounding_chunks:
+        for chunk in cand.grounding_metadata.grounding_chunks:
+            if chunk.web and chunk.web.uri:
+                grounded_urls.append(chunk.web.uri)
+
+    prompt_results = []
+    brand_mentions = 0
+    brand_citations = 0
+
+    for item in synthesis.get("prompt_evaluations", []):
+        m_bool = bool(item.get("brand_mentioned"))
+        c_bool = bool(item.get("domain_cited"))
+        if m_bool:
+            brand_mentions += 1
+        if c_bool:
+            brand_citations += 1
+        comps = item.get("competitors_recommended") or []
+        prompt_results.append(
+            {
+                "Prompt": item.get("prompt", ""),
+                "Brand Mentioned": "✅ Yes" if m_bool else "❌ No",
+                "Domain Cited": "✅ Yes" if c_bool else "❌ No",
+                "Competitors Recommended": ", ".join(comps) if comps else "None / Other brands",
+                "AI Answer Snippet": item.get("simulated_ai_answer", ""),
+            }
+        )
 
     return {
         "plan": plan,
         "brand_mentions": brand_mentions,
         "brand_citations": brand_citations,
         "prompt_results": prompt_results,
+        "grounded_urls": grounded_urls[:10],
         "synthesis": synthesis,
     }
 
@@ -415,8 +386,8 @@ Perform live Google searches for the core keywords and brand vs competitors in {
 # --- UI LAYOUT ---
 st.title("🔍 AEO & AI Visibility Auditor")
 st.caption(
-    "Live replication of a 6-section Answer Engine Optimization audit: checks crawler access, "
-    "schema gaps, live Google-grounded LLM recommendations, competitor share of voice, and SERP displacement."
+    "6-section Answer Engine Optimization audit: checks AI crawler access, schema gaps, "
+    "unbranded buyer prompt visibility, competitor share of voice, and SERP displacement."
 )
 
 with st.sidebar:
@@ -426,9 +397,14 @@ with st.sidebar:
         api_key = st.text_input("Gemini API Key", type="password", help="Or set GEMINI_API_KEY in Streamlit Secrets")
 
     model_name = st.selectbox(
-        "Primary Gemini Model (auto-fallbacks on 503)",
+        "Primary Gemini Model",
         MODEL_CANDIDATES,
         index=0,
+    )
+    use_search_grounding = st.checkbox(
+        "Enable Live Google Search Grounding",
+        value=False,
+        help="Requires a paid Tier 1+ Gemini API billing account (5,000 free grounded calls/mo). Leave unchecked on the $0 Free Tier.",
     )
     market = st.selectbox(
         "Target Market",
@@ -470,12 +446,13 @@ if run_audit:
             st.error(f"Failed to crawl `{clean_url}`: {e}")
             st.stop()
 
-        st.write("2/3 Generating unbranded buyer prompts & querying live search-grounded LLM...")
+        st.write("2/3 Evaluating unbranded buyer prompts, competitors & SERP visibility...")
         client = genai.Client(api_key=api_key)
         try:
             audit_data = run_llm_and_serp_audit(
                 client=client,
                 model_name=model_name,
+                use_search_grounding=use_search_grounding,
                 crawl_data=crawl_data,
                 market=market,
                 competitors_override=competitors_override,
@@ -485,7 +462,7 @@ if run_audit:
             st.error(f"LLM Visibility Audit failed: {e}")
             st.stop()
 
-        st.write("3/3 Compiling competitive snapshot, schema gaps, and top 3 opportunities...")
+        st.write("3/3 Rendering 6-section AEO report...")
         status.update(label="AEO Audit Complete!", state="complete", expanded=False)
 
     plan = audit_data["plan"]
@@ -511,12 +488,10 @@ if run_audit:
         use_container_width=True,
         hide_index=True,
     )
-    with st.expander("View Raw AI Responses & Grounded Source URLs"):
+    with st.expander("View Sample AI Responses"):
         for row in audit_data["prompt_results"]:
             st.markdown(f"**Prompt:** {row['Prompt']}")
             st.write(row["AI Answer Snippet"])
-            if row["Grounded Sources"]:
-                st.caption("Sources: " + " | ".join(row["Grounded Sources"]))
             st.divider()
 
     st.markdown("### 2. Competitive Snapshot")
@@ -555,6 +530,11 @@ if run_audit:
         with st.container(border=True):
             st.markdown(f"**#{idx}: {opp.get('title')}** — Impact: `{opp.get('impact')}` | Effort: `{opp.get('effort')}`")
             st.write(opp.get("action_plan"))
+
+    if audit_data["grounded_urls"]:
+        with st.expander("Grounded Google Search Sources Used"):
+            for u in audit_data["grounded_urls"]:
+                st.write(f"- {u}")
 
     report_payload = json.dumps(
         {"crawl_data": crawl_data, "audit_data": audit_data},
