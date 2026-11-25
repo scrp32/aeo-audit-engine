@@ -4,7 +4,7 @@ import json
 import re
 import time
 import xml.etree.ElementTree as ET
-from urllib.parse import quote_plus, urlparse, urlunparse
+from urllib.parse import quote_plus, urlparse
 
 import pandas as pd
 import requests
@@ -228,15 +228,15 @@ MODEL_CANDIDATES = [
 ]
 
 CHANNELS = [
-    ("Reddit", "site:reddit.com", "#f97316", 60),
-    ("Quora", "site:quora.com", "#eab308", 60),
+    ("Reddit", "site:reddit.com", "#f97316", 45),
+    ("Quora", "site:quora.com", "#eab308", 45),
     ("G2", "site:g2.com", "#ef4444", 15),
     ("Web", "", "#38bdf8", 100),
     ("News", "", "#10b981", 50),
-    ("X", "site:x.com OR site:twitter.com", "#64748b", 25),
-    ("YouTube", "site:youtube.com", "#f43f5e", 25),
-    ("Facebook", "site:facebook.com", "#3b82f6", 25),
-    ("Instagram", "site:instagram.com", "#a855f7", 25),
+    ("X", "site:x.com OR site:twitter.com", "#64748b", 20),
+    ("YouTube", "site:youtube.com", "#f43f5e", 20),
+    ("Facebook", "site:facebook.com", "#3b82f6", 20),
+    ("Instagram", "site:instagram.com", "#a855f7", 20),
 ]
 
 KNOWN_AUTHORITY_1000 = {
@@ -288,16 +288,6 @@ BOT_BLOCK_MARKERS = [
 ]
 
 
-def canonicalize_url(url: str) -> str:
-    """Strips tracking query params/fragments so duplicate SERP URLs for the same thread deduplicate cleanly."""
-    try:
-        p = urlparse(url.strip())
-        clean_path = p.path.rstrip("/")
-        return urlunparse((p.scheme.lower(), p.netloc.lower(), clean_path, "", "", ""))
-    except Exception:
-        return url.strip().lower()
-
-
 def extract_clean_host(url: str) -> str:
     try:
         host = urlparse(url.strip()).netloc.lower()
@@ -321,6 +311,7 @@ def host_matches_allowed(url: str, allowed_domains: list[str]) -> bool:
 
 
 def clean_serp_title(title: str) -> str:
+    """Cleans noisy SERP concatenations like 'Title : r/Sub - RedditSubreddit - Reddit...'."""
     t = re.sub(r"\s+", " ", title).strip()
     t = re.sub(r"\s*-\s*Reddit[A-Za-z0-9 _-]+-\s*Reddit.*$", "", t)
     t = re.sub(r"\s*-\s*Quora$", "", t, flags=re.I)
@@ -519,7 +510,7 @@ def resolve_brand_queries_via_llm(
     brand_override: str,
 ) -> dict:
     prompt = f"""
-Identify the brand and a multi-angle set of search queries for a high-volume Brand Intelligence & AEO audit.
+Identify the brand and search queries for a Brand Intelligence & AEO audit.
 URL: {crawl_data['final_url']} | Domain: {crawl_data['domain']} | Market: {market}
 User Brand Override: {brand_override}
 Page Title: {crawl_data['title']} | OG Site: {crawl_data['og_site_name']} | Meta: {crawl_data['meta_description']}
@@ -530,17 +521,12 @@ Return strict JSON:
   "brand_name": "Clean official brand name (use User Brand Override if provided; otherwise infer accurately from domain/title, e.g. Natural Diamond Council for naturaldiamondcouncil.com, or H.I.M for himscience.com)",
   "category": "concise category",
   "is_b2b_software": true or false,
-  "brand_aliases": [
-    "official brand name",
-    "consumer-facing sub-brand, campaign name, or acronym if applicable (e.g. Only Natural Diamonds)"
+  "brand_queries": [
+    "exact brand query 1 (e.g. \\"Natural Diamond Council\\")",
+    "domain or secondary brand query 2 (e.g. \\"Only Natural Diamonds\\")"
   ],
-  "forum_debate_queries": [
-    "short query 1 (2-4 words, e.g. natural diamonds vs lab grown)",
-    "short query 2 (2-4 words, e.g. are natural diamonds worth it)",
-    "short query 3 (2-4 words, e.g. natural diamond resale value)",
-    "short query 4 (2-4 words, e.g. natural diamond council)"
-  ],
-  "relevance_keywords": ["4-6 lowercase keywords that confirm an article/thread is actually about this brand or its exact industry"]
+  "category_discussion_query": "core consumer/buyer debate query for Reddit/Quora (e.g. natural diamonds vs lab grown)",
+  "relevance_keywords": ["3-5 lowercase keywords that confirm an article/thread is actually about this brand or its exact industry"]
 }}
 """
     try:
@@ -560,29 +546,19 @@ Return strict JSON:
             "brand_name": b,
             "category": "Consumer / Commercial Brand",
             "is_b2b_software": False,
-            "brand_aliases": [b, crawl_data["domain"]],
-            "forum_debate_queries": [b, f"{b} review", f"{b} worth it"],
+            "brand_queries": [f'"{b}"', f'"{crawl_data["domain"]}"'],
+            "category_discussion_query": b,
             "relevance_keywords": [w.lower() for w in b.split() if len(w) >= 3] + [crawl_data["domain"].split(".")[0]],
         }
 
 
 # --- SEARCH ENGINE PROVIDERS ---
-def search_via_serper(
-    query: str,
-    serper_key: str,
-    gl: str = "in",
-    num: int = 30,
-    page: int = 1,
-    search_type: str = "search",
-) -> list[dict]:
+def search_via_serper(query: str, serper_key: str, gl: str = "in", num: int = 30, search_type: str = "search") -> list[dict]:
     endpoint = "[https://google.serper.dev/news](https://google.serper.dev/news)" if search_type == "news" else "[https://google.serper.dev/search](https://google.serper.dev/search)"
-    payload = {"q": query, "gl": gl, "num": min(num, 100)}
-    if page > 1:
-        payload["page"] = page
     resp = requests.post(
         endpoint,
         headers={"X-API-KEY": serper_key, "Content-Type": "application/json"},
-        json=payload,
+        json={"q": query, "gl": gl, "num": min(num, 100)},
         timeout=12,
     )
     resp.raise_for_status()
@@ -663,27 +639,19 @@ def collect_live_mentions_novastacks_scale(
     telemetry = {ch[0]: {"raw": 0, "kept": 0} for ch in CHANNELS}
     seen_urls = set()
     diag = {
-        "engine": "Serper (Google SERP Multi-Angle)" if serper_key else "Tavily Search" if tavily_key else "Free DDGS + Google RSS",
+        "engine": "Serper (Google SERP)" if serper_key else "Tavily Search" if tavily_key else "Free DDGS + Google RSS",
         "errors": [],
         "telemetry": telemetry,
     }
 
     brand_name = brand_meta.get("brand_name", domain)
-    aliases = [a.replace('"', "").strip() for a in brand_meta.get("brand_aliases", []) if a.strip()]
-    if brand_name not in aliases:
-        aliases.insert(0, brand_name)
-    debate_queries = [
-        re.sub(r'["()]', "", q).strip()
-        for q in brand_meta.get("forum_debate_queries", [])
-        if q.strip()
-    ]
-    if not debate_queries:
-        debate_queries = [brand_name]
-
+    brand_queries = brand_meta.get("brand_queries") or [f'"{brand_name}"']
+    cat_query = brand_meta.get("category_discussion_query") or brand_queries[0]
     rel_keywords = [k.lower() for k in brand_meta.get("relevance_keywords", []) if len(k) >= 3]
     domain_stem = domain.split(".")[0].lower()
+
     clean_brand = brand_name.replace('"', "").strip()
-    primary_cat = debate_queries[0]
+    clean_cat = re.sub(r'["()]', "", cat_query).split(" OR ")[0].strip()
 
     domain_matchers = {
         "Reddit": ["reddit.com"],
@@ -699,7 +667,7 @@ def collect_live_mentions_novastacks_scale(
         hay = f"{title} {snippet} {url}".lower()
         if domain.lower() in hay or (len(domain_stem) >= 6 and domain_stem in hay):
             return True
-        if any(len(al) >= 5 and al.lower() in hay for al in aliases):
+        if len(clean_brand) >= 5 and clean_brand.lower() in hay:
             return True
         if exact_brand_only:
             return False
@@ -725,10 +693,7 @@ def collect_live_mentions_novastacks_scale(
             if len(target_bucket) >= cap:
                 break
             u = it.get("href") or it.get("url") or ""
-            if not u:
-                continue
-            canon_u = canonicalize_url(u)
-            if canon_u in seen_urls:
+            if not u or u in seen_urls:
                 continue
             if required_domains and not host_matches_allowed(u, required_domains):
                 continue
@@ -739,7 +704,7 @@ def collect_live_mentions_novastacks_scale(
             dom, da = estimate_domain_authority_1000(u)
             if exclude_own_domain and (dom == domain.lower() or dom.endswith("." + domain.lower())):
                 continue
-            seen_urls.add(canon_u)
+            seen_urls.add(u)
             tag_label = extract_subreddit_or_tag(u, fallback=match_source)
             sent_label = infer_quick_sentiment(f"{title_txt} {snip_txt}")
             target_bucket.append(
@@ -756,123 +721,89 @@ def collect_live_mentions_novastacks_scale(
             )
         telemetry[channel_name]["kept"] = len(target_bucket)
 
-    def run_web_query(
-        query: str,
-        max_res: int,
-        include_domains: list[str] | None = None,
-        gl_override: str | None = None,
-        page: int = 1,
-    ) -> list[dict]:
-        gl_use = gl_override or gl_low
+    def run_web_query(query: str, max_res: int, include_domains: list[str] | None = None) -> list[dict]:
         if serper_key:
             try:
-                return search_via_serper(query, serper_key, gl=gl_use, num=max_res, page=page, search_type="search")
+                return search_via_serper(query, serper_key, gl=gl_low, num=max_res, search_type="search")
             except Exception as e:
                 diag["errors"].append(f"Serper: {str(e)[:120]}")
 
-        if tavily_key and page == 1:
+        if tavily_key:
             try:
                 return search_via_tavily(query, tavily_key, max_results=max_res, include_domains=include_domains)
             except Exception as e:
                 diag["errors"].append(f"Tavily: {str(e)[:120]}")
 
-        if page == 1:
-            try:
-                with DDGS() as ddgs:
-                    time.sleep(0.2)
-                    res = list(ddgs.text(query, region=ddg_region, max_results=max_res))
-                    if res:
-                        return res
-            except Exception as e:
-                msg = f"DDGS web: {str(e)[:90]}"
-                if msg not in diag["errors"]:
-                    diag["errors"].append(msg)
+        try:
+            with DDGS() as ddgs:
+                time.sleep(0.25)
+                res = list(ddgs.text(query, region=ddg_region, max_results=max_res))
+                if res:
+                    return res
+        except Exception as e:
+            msg = f"DDGS web: {str(e)[:90]}"
+            if msg not in diag["errors"]:
+                diag["errors"].append(msg)
         return []
 
-    # 1. High-Volume Reddit & Quora Multi-Angle Harvest (Target: 40-60 each)
-    for forum_name in ("Reddit", "Quora"):
-        site_op = "site:reddit.com" if forum_name == "Reddit" else "site:quora.com"
-        req_doms = domain_matchers[forum_name]
-        cap = 60
-
-        # A. All brand aliases across local + US global index (Page 1 & Page 2 on Serper)
-        for al in aliases[:3]:
-            if len(evidence[forum_name]) >= cap:
-                break
-            q_brand = f'"{al}" {site_op}'
-            ingest(forum_name, run_web_query(q_brand, 30, req_doms, gl_override=gl_low, page=1), cap, req_doms, strict_relevance=False, match_source="Brand Mention")
-            if serper_key and len(evidence[forum_name]) < cap:
-                ingest(forum_name, run_web_query(q_brand, 30, req_doms, gl_override=gl_low, page=2), cap, req_doms, strict_relevance=False, match_source="Brand Mention")
-            if gl_low != "us" and len(evidence[forum_name]) < cap:
-                ingest(forum_name, run_web_query(q_brand, 30, req_doms, gl_override="us", page=1), cap, req_doms, strict_relevance=False, match_source="Global Brand")
-
-        # B. Domain stem mention
-        if len(evidence[forum_name]) < cap and len(domain_stem) >= 6:
-            ingest(forum_name, run_web_query(f"{domain_stem} {site_op}", 30, req_doms), cap, req_doms, strict_relevance=True, match_source="Domain Mention")
-
-        # C. Multi-angle consumer/buyer debate queries (Page 1 + Page 2 + US index)
-        for dq in debate_queries[:4]:
-            if len(evidence[forum_name]) >= cap:
-                break
-            q_cat = f"{dq} {site_op}"
-            ingest(forum_name, run_web_query(q_cat, 30, req_doms, gl_override=gl_low, page=1), cap, req_doms, strict_relevance=True, match_source="Category Debate")
-            if serper_key and len(evidence[forum_name]) < cap:
-                ingest(forum_name, run_web_query(q_cat, 30, req_doms, gl_override=gl_low, page=2), cap, req_doms, strict_relevance=True, match_source="Category Debate")
-            if gl_low != "us" and len(evidence[forum_name]) < cap:
-                ingest(forum_name, run_web_query(q_cat, 30, req_doms, gl_override="us", page=1), cap, req_doms, strict_relevance=True, match_source="Global Debate")
-
-    # 2. Remaining Social & Review Channels (G2, X, YouTube, Facebook, Instagram)
+    # 1. Social & Forum channels
     for name, site_filter, _, cap in CHANNELS:
-        if name in ("Reddit", "Quora", "Web", "News"):
+        if name in ("Web", "News"):
             continue
         req_doms = domain_matchers.get(name)
         is_g2 = name == "G2"
 
-        for al in aliases[:2]:
-            if len(evidence[name]) >= cap:
-                break
-            r1 = run_web_query(f'"{al}" {site_filter}', cap, include_domains=req_doms)
-            ingest(name, r1, cap, required_domains=req_doms, strict_relevance=is_g2, exact_brand_only=is_g2, match_source="Direct Brand")
+        r1 = run_web_query(f'"{clean_brand}" {site_filter}', cap, include_domains=req_doms)
+        ingest(name, r1, cap, required_domains=req_doms, strict_relevance=is_g2, exact_brand_only=is_g2, match_source="Direct Brand")
 
         if not is_g2 and len(evidence[name]) < cap and len(domain_stem) >= 6:
             r1b = run_web_query(f"{domain_stem} {site_filter}", cap, include_domains=req_doms)
             ingest(name, r1b, cap, required_domains=req_doms, strict_relevance=True, match_source="Domain Mention")
 
-    # 3. News (50 target)
+        if name in ("Reddit", "Quora") and len(evidence[name]) < cap and clean_cat.lower() != clean_brand.lower():
+            r2 = run_web_query(f"{clean_cat} {site_filter}", cap, include_domains=req_doms)
+            ingest(name, r2, cap, required_domains=req_doms, strict_relevance=True, match_source="Category Debate")
+
+    # 2. News (50 target)
     if serper_key:
         try:
-            for al in aliases[:2]:
-                if len(evidence["News"]) < 50:
-                    ingest("News", search_via_serper(al, serper_key, gl=gl_low, num=35, search_type="news"), 50, strict_relevance=False, match_source="Brand Press")
-            if len(evidence["News"]) < 50 and primary_cat.lower() != clean_brand.lower():
-                ingest("News", search_via_serper(primary_cat, serper_key, gl=gl_low, num=25, search_type="news"), 50, strict_relevance=True, match_source="Category Press")
+            ingest(
+                "News",
+                search_via_serper(clean_brand, serper_key, gl=gl_low, num=35, search_type="news"),
+                50,
+                strict_relevance=False,
+                match_source="Brand Press",
+            )
+            if len(evidence["News"]) < 50 and clean_cat.lower() != clean_brand.lower():
+                ingest(
+                    "News",
+                    search_via_serper(clean_cat, serper_key, gl=gl_low, num=25, search_type="news"),
+                    50,
+                    strict_relevance=True,
+                    match_source="Category Press",
+                )
         except Exception as e:
             diag["errors"].append(f"Serper News: {str(e)[:120]}")
     else:
         try:
             with DDGS() as ddgs:
                 ingest("News", list(ddgs.news(clean_brand, region=ddg_region, max_results=30)), 50, strict_relevance=False)
-                if len(evidence["News"]) < 50 and primary_cat.lower() != clean_brand.lower():
-                    ingest("News", list(ddgs.news(primary_cat, region=ddg_region, max_results=30)), 50, strict_relevance=True)
+                if len(evidence["News"]) < 50 and clean_cat.lower() != clean_brand.lower():
+                    ingest("News", list(ddgs.news(clean_cat, region=ddg_region, max_results=30)), 50, strict_relevance=True)
         except Exception:
             pass
         if len(evidence["News"]) < 25:
             ingest("News", search_google_news_rss(clean_brand, gl=gl_up, max_res=30), 50, strict_relevance=False)
 
-    # 4. General Web (100 target)
-    for al in aliases[:2]:
-        if len(evidence["Web"]) < 100:
-            w1 = run_web_query(f'"{al}"', 50, page=1)
-            ingest("Web", w1, 100, exclude_own_domain=True, strict_relevance=False, match_source="Web Mention")
-            if serper_key and len(evidence["Web"]) < 100:
-                w1_p2 = run_web_query(f'"{al}"', 50, page=2)
-                ingest("Web", w1_p2, 100, exclude_own_domain=True, strict_relevance=False, match_source="Web Mention")
-    if len(evidence["Web"]) < 100 and primary_cat.lower() != clean_brand.lower():
-        w2 = run_web_query(primary_cat, 50)
+    # 3. General Web (100 target)
+    w1 = run_web_query(f'"{clean_brand}"', 60)
+    ingest("Web", w1, 100, exclude_own_domain=True, strict_relevance=False, match_source="Web Mention")
+    if len(evidence["Web"]) < 100 and clean_cat.lower() != clean_brand.lower():
+        w2 = run_web_query(clean_cat, 60)
         ingest("Web", w2, 100, exclude_own_domain=True, strict_relevance=True, match_source="Category Web")
 
     if len(evidence["Web"]) == 0 and not serper_key and not tavily_key:
-        rss_web = search_google_news_rss(f"{clean_brand} OR {primary_cat}", gl=gl_up, max_res=30)
+        rss_web = search_google_news_rss(f"{clean_brand} OR {clean_cat}", gl=gl_up, max_res=30)
         ingest("Web", rss_web, 40, exclude_own_domain=True, strict_relevance=True)
 
     return evidence, diag
@@ -917,7 +848,7 @@ def run_brand_intelligence_pipeline(
                 "domain": it["domain"],
                 "da": it["authority_1000"],
             }
-            for it in items[:10]
+            for it in items[:8]
         ]
         for ch, items in evidence.items()
         if items
@@ -1216,7 +1147,7 @@ if run_btn:
         if crawl_data.get("crawl_blocked"):
             st.write(f"ℹ️ Site WAF blocked direct scrape ({crawl_data.get('crawl_note')}); using AI domain entity resolution.")
 
-        st.write("2/3 Harvesting multi-angle Reddit, Quora, News, Web & Social threads + Domain Authority...")
+        st.write("2/3 Harvesting live Reddit, Quora, News, Web & Social threads + Domain Authority...")
         client = genai.Client(api_key=api_key)
         try:
             report = run_brand_intelligence_pipeline(
@@ -1389,8 +1320,8 @@ with st.expander("🔎 Harvest Telemetry (Raw Search Hits vs. Kept After Filteri
     tel = search_diag.get("telemetry", {})
     bmeta = report.get("brand_meta", {})
     st.caption(
-        f"Engine: **{search_diag.get('engine')}** | Aliases: `{bmeta.get('brand_aliases')}` | "
-        f"Debate Queries: `{bmeta.get('forum_debate_queries')}`"
+        f"Engine: **{search_diag.get('engine')}** | Resolved Brand: **{bmeta.get('brand_name')}** | "
+        f"Category Query: `{bmeta.get('category_discussion_query')}` | Keywords: `{bmeta.get('relevance_keywords')}`"
     )
     if tel:
         tel_df = pd.DataFrame(
@@ -1438,24 +1369,18 @@ with tq:
     st.markdown(f"#### On Quora ({quora_cnt} questions)")
     if not quora_items:
         st.caption("No Quora threads captured in this run.")
-    for item in quora_items[:8]:
+    for item in quora_items[:6]:
         render_rich_thread_card(item, "Quora")
 
 with tr:
     st.markdown(f"#### On Reddit ({reddit_cnt} threads)")
     if not reddit_items:
         st.caption("No Reddit threads captured in this run.")
-    for item in reddit_items[:8]:
+    for item in reddit_items[:6]:
         render_rich_thread_card(item, "Reddit")
 
 with st.expander(f"📂 Browse All {total_mentions} Harvested Threads & Mentions (Full Detailed Table)", expanded=False):
-    tab_names = [
-        f"Reddit ({reddit_cnt})",
-        f"Quora ({quora_cnt})",
-        f"News ({len(evidence.get('News', []))})",
-        f"Web ({len(evidence.get('Web', []))})",
-        "Social (X / YT / FB / IG)",
-    ]
+    tab_names = ["Reddit", "Quora", "News", "Web", "Social (X / YT / FB / IG)"]
     tabs = st.tabs(tab_names)
 
     def render_evidence_table(items_list: list[dict]):
@@ -1486,9 +1411,9 @@ with st.expander(f"📂 Browse All {total_mentions} Harvested Threads & Mentions
         )
 
     with tabs[0]:
-        render_evidence_table(reddit_items)
+        render_evidence_table(evidence.get("Reddit", []))
     with tabs[1]:
-        render_evidence_table(quora_items)
+        render_evidence_table(evidence.get("Quora", []))
     with tabs[2]:
         render_evidence_table(evidence.get("News", []))
     with tabs[3]:
