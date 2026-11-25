@@ -1,5 +1,7 @@
 import json
 import re
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urljoin, urlparse
 
 import pandas as pd
@@ -36,6 +38,12 @@ RECOMMENDED_SCHEMAS = {
     "HowTo",
 }
 
+MODEL_CANDIDATES = [
+    "gemini-3.8-flash",
+    "gemini-3-flash-preview",
+    "gemini-3.6-flash",
+]
+
 
 def normalize_url(raw_url: str) -> str:
     raw_url = raw_url.strip()
@@ -51,6 +59,40 @@ def safe_json_loads(raw_text: str) -> dict:
         cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
         cleaned = re.sub(r"\s*```$", "", cleaned)
     return json.loads(cleaned)
+
+
+def generate_with_resilience(
+    client: genai.Client,
+    primary_model: str,
+    contents: str,
+    config: types.GenerateContentConfig,
+    max_retries: int = 3,
+):
+    """Retries on 503/429 high-demand spikes and falls back across Flash models."""
+    ordered_models = [primary_model] + [m for m in MODEL_CANDIDATES if m != primary_model]
+    last_err = None
+
+    for model_id in ordered_models:
+        for attempt in range(max_retries):
+            try:
+                return client.models.generate_content(
+                    model=model_id,
+                    contents=contents,
+                    config=config,
+                )
+            except Exception as err:
+                last_err = err
+                err_str = str(err).upper()
+                # If model ID is invalid/not found, immediately try next fallback model
+                if "404" in err_str or "NOT_FOUND" in err_str:
+                    break
+                # Retry transient 503/429 capacity errors with backoff
+                if any(code in err_str for code in ["503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED"]):
+                    time.sleep(2 ** (attempt + 1))
+                    continue
+                raise err
+
+    raise RuntimeError(f"All fallback Gemini models returned errors. Last error: {last_err}")
 
 
 def check_robots_and_llms(base_url: str) -> dict:
@@ -204,6 +246,53 @@ def crawl_site(url: str) -> dict:
     }
 
 
+def evaluate_single_prompt(
+    client: genai.Client,
+    model_name: str,
+    search_tool: types.Tool,
+    bp: str,
+    market: str,
+    brand: str,
+    domain: str,
+    competitors: list[str],
+) -> dict:
+    live_resp = generate_with_resilience(
+        client=client,
+        primary_model=model_name,
+        contents=(
+            f"Answer this user query thoroughly for someone in {market}, "
+            f"recommending specific brands, platforms, or providers where relevant:\n\n{bp}"
+        ),
+        config=types.GenerateContentConfig(
+            tools=[search_tool],
+            temperature=0.3,
+        ),
+    )
+    ans_text = live_resp.text or ""
+
+    cited_urls = []
+    cand = live_resp.candidates[0] if live_resp.candidates else None
+    if cand and cand.grounding_metadata and cand.grounding_metadata.grounding_chunks:
+        for chunk in cand.grounding_metadata.grounding_chunks:
+            if chunk.web and chunk.web.uri:
+                cited_urls.append(chunk.web.uri)
+
+    mentioned = brand.lower() in ans_text.lower() or domain.lower() in ans_text.lower()
+    cited = any(domain.lower() in u.lower() for u in cited_urls) or (domain.lower() in ans_text.lower())
+    comp_hits = [c for c in competitors if c.lower() in ans_text.lower()]
+
+    return {
+        "Prompt": bp,
+        "Brand Mentioned": "✅ Yes" if mentioned else "❌ No",
+        "Domain Cited": "✅ Yes" if cited else "❌ No",
+        "Competitors Recommended": ", ".join(comp_hits) if comp_hits else "None / Other brands",
+        "AI Answer Snippet": ans_text[:450] + ("..." if len(ans_text) > 450 else ""),
+        "Grounded Sources": cited_urls[:5],
+        "_mentioned_bool": mentioned,
+        "_cited_bool": cited,
+    }
+
+
 def run_llm_and_serp_audit(
     client: genai.Client,
     model_name: str,
@@ -234,8 +323,9 @@ Return strict JSON with keys:
 - "buyer_prompts": list of 5 realistic unbranded buyer-intent search/AI prompts a prospect in {market} would ask ChatGPT/Gemini when looking for this solution (do NOT include the brand name in these prompts)
 - "core_keywords": list of 4 core commercial/informational Google search keywords for this business in {market}
 """
-    plan_resp = client.models.generate_content(
-        model=model_name,
+    plan_resp = generate_with_resilience(
+        client=client,
+        primary_model=model_name,
         contents=discovery_prompt,
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
@@ -247,49 +337,32 @@ Return strict JSON with keys:
     brand = plan["brand_name"]
     domain = crawl_data["domain"]
     competitors = plan["competitors"][:2]
+    buyer_prompts = plan["buyer_prompts"][:5]
 
-    # Step 2: Execute Live Google-Search-Grounded Queries for each Buyer Prompt
-    prompt_results = []
-    brand_mentions = 0
-    brand_citations = 0
+    # Step 2: Execute Live Google-Search-Grounded Queries concurrently
+    prompt_results_map = {}
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        futures = {
+            pool.submit(
+                evaluate_single_prompt,
+                client,
+                model_name,
+                search_tool,
+                bp,
+                market,
+                brand,
+                domain,
+                competitors,
+            ): idx
+            for idx, bp in enumerate(buyer_prompts)
+        }
+        for future in as_completed(futures):
+            idx = futures[future]
+            prompt_results_map[idx] = future.result()
 
-    for bp in plan["buyer_prompts"][:5]:
-        live_resp = client.models.generate_content(
-            model=model_name,
-            contents=f"Answer this user query thoroughly for someone in {market}, recommending specific brands, platforms, or providers where relevant:\n\n{bp}",
-            config=types.GenerateContentConfig(
-                tools=[search_tool],
-                temperature=0.3,
-            ),
-        )
-        ans_text = live_resp.text or ""
-
-        cited_urls = []
-        cand = live_resp.candidates[0] if live_resp.candidates else None
-        if cand and cand.grounding_metadata and cand.grounding_metadata.grounding_chunks:
-            for chunk in cand.grounding_metadata.grounding_chunks:
-                if chunk.web and chunk.web.uri:
-                    cited_urls.append(chunk.web.uri)
-
-        mentioned = brand.lower() in ans_text.lower() or domain.lower() in ans_text.lower()
-        cited = any(domain.lower() in u.lower() for u in cited_urls) or (domain.lower() in ans_text.lower())
-        comp_hits = [c for c in competitors if c.lower() in ans_text.lower()]
-
-        if mentioned:
-            brand_mentions += 1
-        if cited:
-            brand_citations += 1
-
-        prompt_results.append(
-            {
-                "Prompt": bp,
-                "Brand Mentioned": "✅ Yes" if mentioned else "❌ No",
-                "Domain Cited": "✅ Yes" if cited else "❌ No",
-                "Competitors Recommended": ", ".join(comp_hits) if comp_hits else "None / Other brands",
-                "AI Answer Snippet": ans_text[:450] + ("..." if len(ans_text) > 450 else ""),
-                "Grounded Sources": cited_urls[:5],
-            }
-        )
+    prompt_results = [prompt_results_map[i] for i in range(len(buyer_prompts))]
+    brand_mentions = sum(1 for r in prompt_results if r.pop("_mentioned_bool"))
+    brand_citations = sum(1 for r in prompt_results if r.pop("_cited_bool"))
 
     # Step 3: Grounded SERP + Competitive Snapshot + Top 3 Opportunities
     synthesis_prompt = f"""
@@ -318,8 +391,9 @@ Perform live Google searches for the core keywords and brand vs competitors in {
 3. "schema_recommendations": list of 3 specific JSON-LD schema additions tailored to {domain} with exact rationale.
 4. "top_3_opportunities": list of 3 objects, each with "title", "impact" ("High" or "Critical"), "effort" ("Low", "Medium", "High"), and "action_plan" (concrete, non-generic steps tailored to {domain}).
 """
-    synth_resp = client.models.generate_content(
-        model=model_name,
+    synth_resp = generate_with_resilience(
+        client=client,
+        primary_model=model_name,
         contents=synthesis_prompt,
         config=types.GenerateContentConfig(
             tools=[search_tool],
@@ -352,8 +426,8 @@ with st.sidebar:
         api_key = st.text_input("Gemini API Key", type="password", help="Or set GEMINI_API_KEY in Streamlit Secrets")
 
     model_name = st.selectbox(
-        "Gemini Model",
-        ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-3-flash-preview"],
+        "Primary Gemini Model (auto-fallbacks on 503)",
+        MODEL_CANDIDATES,
         index=0,
     )
     market = st.selectbox(
