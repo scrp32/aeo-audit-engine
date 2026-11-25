@@ -179,26 +179,24 @@ HEADERS = {
 }
 
 MODEL_CANDIDATES = [
-    "gemini-4-hydrogen",
     "gemini-3.8-flash",
-    "gemini-3.6-flash",
     "gemini-3.5-flash-lite",
+    "gemini-4-hydrogen",
+    "gemini-3.6-flash",
 ]
 
-# Platform configs: (Name, site query, badge color, max live search pull)
 CHANNELS = [
     ("Reddit", "site:reddit.com", "#f97316", 20),
     ("Quora", "site:quora.com", "#eab308", 20),
     ("G2", "site:g2.com", "#ef4444", 10),
-    ("Web", "", "#38bdf8", 35),
-    ("News", "", "#10b981", 20),
-    ("X", "site:x.com OR site:twitter.com", "#64748b", 12),
-    ("YouTube", "site:youtube.com", "#f43f5e", 12),
-    ("Facebook", "site:facebook.com", "#3b82f6", 12),
-    ("Instagram", "site:instagram.com", "#a855f7", 12),
+    ("Web", "", "#38bdf8", 30),
+    ("News", "", "#10b981", 18),
+    ("X", "site:x.com OR site:twitter.com", "#64748b", 10),
+    ("YouTube", "site:youtube.com", "#f43f5e", 10),
+    ("Facebook", "site:facebook.com", "#3b82f6", 10),
+    ("Instagram", "site:instagram.com", "#a855f7", 10),
 ]
 
-# Deterministic 0-1000 Domain Authority reference map (mirrors OpenPageRank/Ahrefs 1000-pt scale in Novastacks PDF)
 KNOWN_AUTHORITY_1000 = {
     "nytimes.com": 940,
     "forbes.com": 920,
@@ -234,7 +232,6 @@ KNOWN_AUTHORITY_1000 = {
 
 
 def estimate_domain_authority_1000(url: str) -> tuple[str, int]:
-    """Returns (clean_domain, authority_score_out_of_1000)."""
     try:
         netloc = urlparse(url).netloc.lower().replace("www.", "")
     except Exception:
@@ -250,7 +247,6 @@ def estimate_domain_authority_1000(url: str) -> tuple[str, int]:
     if root in KNOWN_AUTHORITY_1000:
         return (netloc, KNOWN_AUTHORITY_1000[root])
 
-    # Heuristic baseline for general publications/blogs
     score = 260
     if netloc.endswith((".gov", ".gov.in", ".edu", ".ac.in", ".org")):
         score += 180
@@ -268,6 +264,24 @@ def normalize_url(raw_url: str) -> str:
     if not raw_url.startswith(("http://", "https://")):
         raw_url = "https://" + raw_url
     return raw_url
+
+
+def infer_brand_from_crawl(crawl_data: dict) -> str:
+    """Extracts clean brand name locally without burning an extra LLM call."""
+    og_site = crawl_data.get("og_site_name", "").strip()
+    if og_site and len(og_site) < 45:
+        return og_site
+    title = crawl_data.get("title", "")
+    if title:
+        for sep in [" | ", " - ", " – ", " — ", ": "]:
+            if sep in title:
+                parts = [p.strip() for p in title.split(sep) if p.strip()]
+                # Usually shortest clean segment is the brand name
+                candidate = min(parts, key=len)
+                if 2 <= len(candidate) <= 40:
+                    return candidate
+    root = crawl_data["domain"].split(".")[0]
+    return root.replace("-", " ").title()
 
 
 def safe_json_loads(raw_text: str) -> dict:
@@ -304,25 +318,28 @@ def generate_with_resilience(
     config: types.GenerateContentConfig,
 ):
     ordered_models = [primary_model] + [m for m in MODEL_CANDIDATES if m != primary_model]
-    last_err = None
+    errors_seen = []
+
     for model_id in ordered_models:
-        for attempt in range(2):
-            try:
-                return client.models.generate_content(
-                    model=model_id,
-                    contents=contents,
-                    config=config,
-                )
-            except Exception as err:
-                last_err = err
-                err_str = str(err).upper()
-                if any(k in err_str for k in ["404", "NOT_FOUND", "429", "RESOURCE_EXHAUSTED"]):
-                    break
-                if "503" in err_str or "UNAVAILABLE" in err_str:
-                    time.sleep(2 * (attempt + 1))
-                    continue
-                raise err
-    raise RuntimeError(f"All fallback models hit rate/availability limits. Last error: {last_err}")
+        try:
+            return client.models.generate_content(
+                model=model_id,
+                contents=contents,
+                config=config,
+            )
+        except Exception as err:
+            err_msg = str(err)
+            errors_seen.append(f"{model_id}: {err_msg[:180]}")
+            upper = err_msg.upper()
+            # If transient 503 or 429 per-minute spike, pause briefly before trying next model
+            if any(k in upper for k in ["503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED"]):
+                time.sleep(3)
+                continue
+            if "404" in upper or "NOT_FOUND" in upper:
+                continue
+            raise RuntimeError(f"Gemini API Error on {model_id}: {err_msg}")
+
+    raise RuntimeError(" | ".join(errors_seen))
 
 
 def crawl_homepage(url: str) -> dict:
@@ -331,6 +348,8 @@ def crawl_homepage(url: str) -> dict:
     soup = BeautifulSoup(resp.text, "lxml")
 
     title = soup.title.string.strip() if soup.title and soup.title.string else ""
+    og_site_tag = soup.find("meta", attrs={"property": "og:site_name"})
+    og_site_name = og_site_tag.get("content", "").strip() if og_site_tag else ""
     meta_tag = soup.find("meta", attrs={"name": re.compile("^description$", re.I)})
     meta_desc = meta_tag.get("content", "").strip() if meta_tag else ""
     h1s = [h.get_text(" ", strip=True) for h in soup.find_all("h1")]
@@ -356,16 +375,16 @@ def crawl_homepage(url: str) -> dict:
         "final_url": resp.url,
         "domain": urlparse(resp.url).netloc.replace("www.", ""),
         "title": title,
+        "og_site_name": og_site_name,
         "meta_description": meta_desc,
-        "h1s": h1s[:5],
-        "h2s": h2s[:10],
+        "h1s": h1s[:4],
+        "h2s": h2s[:8],
         "schemas": sorted(set(schemas)),
-        "excerpt": text[:3500],
+        "excerpt": text[:1800],
     }
 
 
-def collect_live_mentions(brand: str, domain: str, category: str, market: str) -> dict:
-    """Pulls deduplicated live mentions across all 9 channels & scores domain authority."""
+def collect_live_mentions(brand: str, domain: str, market: str) -> dict:
     region_map = {
         "India": "in-en",
         "United States": "us-en",
@@ -391,17 +410,15 @@ def collect_live_mentions(brand: str, domain: str, category: str, market: str) -
             cleaned.append(
                 {
                     "title": it.get("title", "").strip(),
-                    "snippet": (it.get("body") or it.get("snippet") or "").strip()[:260],
+                    "snippet": (it.get("body") or it.get("snippet") or "").strip()[:180],
                     "url": u,
                     "domain": dom,
                     "authority_1000": da,
-                    "date": it.get("date", ""),
                 }
             )
         return cleaned
 
     with DDGS() as ddgs:
-        # 1. Social & Forum channels first so Web doesn't swallow them
         for name, site_filter, _, limit in CHANNELS:
             if name in ("Web", "News"):
                 continue
@@ -411,20 +428,18 @@ def collect_live_mentions(brand: str, domain: str, category: str, market: str) -
             except Exception:
                 evidence[name] = []
 
-        # 2. News coverage
         try:
-            raw_news = list(ddgs.news(f'"{brand}"', region=region, max_results=20))
+            raw_news = list(ddgs.news(f'"{brand}"', region=region, max_results=18))
             evidence["News"] = dedup_and_enrich(raw_news)
         except Exception:
             evidence["News"] = []
 
-        # 3. General Web mentions (excluding social platforms already bucketed above)
         try:
             raw_web = list(
                 ddgs.text(
                     f'"{brand}" -site:reddit.com -site:quora.com -site:youtube.com -site:facebook.com -site:instagram.com -site:x.com',
                     region=region,
-                    max_results=35,
+                    max_results=30,
                 )
             )
             evidence["Web"] = dedup_and_enrich(raw_web, exclude_own_domain=True)
@@ -440,120 +455,97 @@ def run_brand_intelligence_pipeline(
     crawl_data: dict,
     market: str,
     competitors_override: list[str],
+    brand_override: str = "",
 ) -> dict:
-    # Call 1: Entity, Category, Direct Competitors & Category Pressure
-    entity_prompt = f"""
-Identify the brand entity, industry category, direct competitors, and primary category/alternative pressure in {market}:
-Domain: {crawl_data['domain']}
-Title: {crawl_data['title']}
-Meta: {crawl_data['meta_description']}
-H1s: {crawl_data['h1s']}
-User competitor overrides (use if provided): {competitors_override}
-Excerpt: {crawl_data['excerpt'][:2000]}
+    # Step 1: Resolve brand name locally (0 LLM calls) and harvest live mentions
+    brand = brand_override.strip() or infer_brand_from_crawl(crawl_data)
+    evidence = collect_live_mentions(brand, crawl_data["domain"], market)
 
-Return strict JSON:
-{{
-  "brand_name": "official brand name",
-  "category": "concise category",
-  "is_b2b_software": true or false,
-  "direct_competitors": [
-    {{"domain": "competitor1.com", "type": "Branded retail / Direct SaaS / Marketplace", "summary": "1 sentence on how they compete for the same buyer"}}
-  ],
-  "category_pressure": {{
-    "label": "e.g. Lab grown sellers (category) / DIY templates / Aggregator marketplaces",
-    "summary": "2 sentences explaining the alternative/substitutes driving buyer skepticism in Reddit/Quora threads."
-  }}
-}}
-"""
-    ent_resp = generate_with_resilience(
-        client=client,
-        primary_model=model_name,
-        contents=entity_prompt,
-        config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.1),
-    )
-    entity = safe_json_loads(ent_resp.text)
-    brand = entity["brand_name"]
-
-    # Step 2: Live multi-channel harvest with real counts & DA scores
-    evidence = collect_live_mentions(brand, crawl_data["domain"], entity["category"], market)
-
-    # Deterministic channel counts & authority metrics from actual harvested items
     actual_counts = {ch: len(items) for ch, items in evidence.items()}
     total_harvested = sum(actual_counts.values())
     active_channel_count = sum(1 for v in actual_counts.values() if v > 0)
 
     web_items = evidence.get("Web", [])
-    avg_da = (
-        int(sum(x["authority_1000"] for x in web_items) / len(web_items))
-        if web_items
-        else 280
-    )
+    avg_da = int(sum(x["authority_1000"] for x in web_items) / len(web_items)) if web_items else 280
 
-    # Top web/news mentions sorted by Domain Authority for Section 05
     combined_authority_pool = sorted(
         evidence.get("Web", []) + evidence.get("News", []),
         key=lambda x: x["authority_1000"],
         reverse=True,
-    )[:8]
+    )[:6]
 
-    # Compact payload for Gemini classification & strategic synthesis
+    # Keep digest compact (~2,200 tokens max) so Free Tier TPM never trips
     digest_for_llm = {
         ch: [
             {
-                "title": it["title"],
-                "snippet": it["snippet"][:180],
+                "title": it["title"][:100],
+                "snippet": it["snippet"][:130],
                 "domain": it["domain"],
-                "authority_1000": it["authority_1000"],
-                "url": it["url"],
+                "da": it["authority_1000"],
             }
-            for it in items[:12]
+            for it in items[:6]
         ]
         for ch, items in evidence.items()
+        if items
     }
 
-    # Call 2: Classify Sentiment, Extract Threads, Pain Points, Deep Dive & Strategy
+    # Single Consolidated Gemini Call for Entity, Sentiment, Competitors & Strategy
     synthesis_prompt = f"""
 You are a senior Brand Intelligence & AEO analyst producing an executive report matching Novastacks AI's methodology.
-Brand: {brand} ({crawl_data['domain']}) | Category: {entity['category']} | Market: {market}
-Actual Harvested Mention Counts per Channel: {json.dumps(actual_counts)} (Total: {total_harvested}, Active: {active_channel_count}/9)
+Brand Candidate: {brand} | Domain: {crawl_data['domain']} | Market: {market}
+Page Title: {crawl_data['title']} | Meta: {crawl_data['meta_description']}
+User Competitor Overrides: {competitors_override}
+Homepage Excerpt: {crawl_data['excerpt'][:900]}
+Actual Harvested Mention Counts: {json.dumps(actual_counts)} (Total: {total_harvested}, Active: {active_channel_count}/9)
 Average Web Source Domain Authority: {avg_da}/1000
-Is B2B Software: {entity['is_b2b_software']}
 
-Harvested Live Evidence across all 9 channels:
-{json.dumps(digest_for_llm, indent=2)}
+Live Harvested Evidence Sample:
+{json.dumps(digest_for_llm)}
 
-Return strict JSON grounded strictly in the harvested evidence above:
+Return strict JSON grounded strictly in the evidence above:
 {{
+  "entity": {{
+    "brand_name": "verified official brand name",
+    "category": "concise category",
+    "is_b2b_software": true or false,
+    "direct_competitors": [
+      {{"domain": "competitor1.com", "type": "Branded retail / Direct SaaS / Marketplace", "summary": "1 sentence on how they compete"}}
+    ],
+    "category_pressure": {{
+      "label": "Primary alternative/substitute category creating buyer skepticism",
+      "summary": "2 sentences explaining how this alternative drives negative/skeptical threads."
+    }}
+  }},
   "executive_summary": {{
     "headline": "What People Are Saying: <6-10 word thesis>",
     "paragraphs": [
-      "Paragraph 1 summarizing total mentions ({total_harvested} across {active_channel_count} of 9 channels) and exact sentiment split.",
-      "Paragraph 2 summarizing Quora & Reddit question/debate themes using real titles from the evidence.",
+      "Paragraph 1 summarizing total mentions ({total_harvested} across {active_channel_count} of 9 channels) and sentiment split.",
+      "Paragraph 2 summarizing Quora & Reddit question/debate themes citing real titles from the evidence.",
       "Paragraph 3 summarizing News/Media and owned channel balance and the core narrative gap to manage."
     ]
   }},
-  "freshness_score": integer (0-100 based on recency of news/threads in evidence),
-  "score_commentary": "2 sentence takeaway explaining what holds back the Brand Health Score (e.g. sentiment split or low avg domain authority {avg_da}/1000).",
+  "freshness_score": integer (0-100),
+  "score_commentary": "2 sentence takeaway on what holds back the Brand Health Score.",
   "channel_notes": [
     {{
       "platform": "Reddit",
       "conversation_type": "Debate / Mixed | Question driven | Not applicable | Polarized | Mostly positive | Brand / Trade | Brand owned | Industry / Partner",
-      "note": "concise note (if G2 is 0 and non-software, write 'Not applicable (consumer/service brand)')",
-      "deep_dive_read": "1-2 sentence qualitative read on channel dynamics for Section 09 Social Media Deep Dive"
+      "note": "concise note",
+      "deep_dive_read": "1-2 sentence qualitative read on this channel"
     }}
   ],
   "sentiment": {{
     "headline": "2-4 word headline e.g. A Polarized Conversation",
-    "intro": "2 sentence explanation of sentiment classification across the web & social mentions.",
+    "intro": "2 sentence explanation of the sentiment classification.",
     "positive_pct": integer,
     "negative_pct": integer,
     "neutral_pct": integer,
     "narrative": "2-3 sentence analytical callout explaining what drives negative vs positive share.",
     "quora_threads": [
-      {{"title": "exact Quora question title from evidence", "tag": "Mentions Brand or Category", "url": "url"}}
+      {{"title": "real Quora question from evidence", "tag": "Mentions Brand or Category"}}
     ],
     "reddit_threads": [
-      {{"title": "exact Reddit thread title from evidence", "tag": "r/subreddit", "url": "url"}}
+      {{"title": "real Reddit thread from evidence", "tag": "r/subreddit"}}
     ]
   }},
   "news_cards": [
@@ -561,13 +553,12 @@ Return strict JSON grounded strictly in the harvested evidence above:
       "headline": "real news/press headline from evidence",
       "domain": "outlet.com",
       "tone": "Positive | Negative | Neutral",
-      "summary": "1-2 sentence factual summary of the coverage and why it scored Positive/Negative.",
-      "url": "url"
+      "summary": "1-2 sentence summary of the coverage."
     }}
   ],
   "top_authority_sentiments": [
     {{
-      "domain": "domain from top authority list",
+      "domain": "domain",
       "headline": "headline",
       "authority": integer,
       "sentiment": "Positive | Negative | Neutral"
@@ -577,7 +568,7 @@ Return strict JSON grounded strictly in the harvested evidence above:
     {{
       "title": "Pain point title",
       "channels": "e.g. Quora, Web",
-      "detail": "1-2 sentence concrete explanation grounded in evidence."
+      "detail": "1-2 sentence explanation."
     }}
   ],
   "thread_triage": {{
@@ -594,7 +585,7 @@ Return strict JSON grounded strictly in the harvested evidence above:
   "response_playbook": [
     {{
       "channel": "Reddit | Quora | News | Owned Content",
-      "action": "Actionable playbook rule grounded in findings"
+      "action": "Actionable playbook rule"
     }}
   ],
   "content_strategy": [
@@ -612,11 +603,11 @@ Return strict JSON grounded strictly in the harvested evidence above:
         config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.2),
     )
     ai_out = safe_json_loads(synth_resp.text)
+    entity = ai_out.get("entity", {"brand_name": brand, "category": "", "is_b2b_software": False})
 
-    # Deterministic Brand Health Score computation matching PDF weights (30/20/20/15/15)
     pos_pct = ai_out.get("sentiment", {}).get("positive_pct", 50)
     sent_score = max(0, min(100, int(pos_pct)))
-    vol_score = min(100, int((total_harvested / 120) * 100))
+    vol_score = min(100, int((total_harvested / 110) * 100))
     reach_score = min(100, int((avg_da / 1000) * 100))
     cov_score = int((active_channel_count / 9) * 100)
     fresh_score = max(0, min(100, int(ai_out.get("freshness_score", 55))))
@@ -687,6 +678,7 @@ with st.sidebar:
         api_key = st.text_input("Gemini API Key", type="password", help="Or set GEMINI_API_KEY in Streamlit Secrets")
 
     target_url = st.text_input("Target Website URL", placeholder="[https://www.naturaldiamonds.com/in](https://www.naturaldiamonds.com/in)")
+    brand_override = st.text_input("Brand Name (optional)", placeholder="Auto-detected from site if blank")
     market = st.selectbox(
         "Target Market",
         ["India", "United States", "United Kingdom", "Singapore", "Australia", "Global"],
@@ -731,11 +723,22 @@ if run_btn:
 
     with st.status("Running 11-Section Brand Intelligence & AEO Harvest...", expanded=True) as status:
         st.write("1/3 Crawling target URL metadata & JSON-LD entities...")
-        crawl_data = crawl_homepage(clean_url)
+        try:
+            crawl_data = crawl_homepage(clean_url)
+        except Exception as e:
+            st.error(f"Could not crawl `{clean_url}`: {e}")
+            st.stop()
 
         st.write("2/3 Harvesting live Reddit, Quora, News, Web & Social threads + Domain Authority...")
         client = genai.Client(api_key=api_key)
-        report = run_brand_intelligence_pipeline(client, model_name, crawl_data, market, comps)
+        try:
+            report = run_brand_intelligence_pipeline(
+                client, model_name, crawl_data, market, comps, brand_override
+            )
+        except Exception as e:
+            st.error(f"API Quota / Model Error: {e}")
+            st.info("Tip: If you hit a Free Tier per-minute rate limit, wait 45 seconds and click Generate Full Report again.")
+            st.stop()
 
         st.write("3/3 Computing weighted Brand Health Score, sentiment split & playbook...")
         status.update(label="Report Generated!", state="complete", expanded=False)
