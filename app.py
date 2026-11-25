@@ -23,135 +23,134 @@ st.set_page_config(
 st.markdown(
     """
 <style>
-    /* Main dark canvas with subtle technical grid */
-    .stApp {
-        background-color: #0b0f14;
-        background-image:
-            linear-gradient(to right, rgba(255, 255, 255, 0.025) 1px, transparent 1px),
-            linear-gradient(to bottom, rgba(255, 255, 255, 0.025) 1px, transparent 1px);
-        background-size: 36px 36px;
-        color: #e6edf3;
-    }
-    section[data-testid="stSidebar"] {
-        background-color: #090c10;
-        border-right: 1px solid #1e2631;
-    }
-    .section-kicker {
-        font-family: monospace;
-        font-size: 0.78rem;
-        letter-spacing: 0.14em;
-        color: #22d3ee;
-        text-transform: uppercase;
-        margin-bottom: 0.25rem;
-    }
-    .hero-brand {
-        font-size: 3.1rem;
-        font-weight: 800;
-        color: #22d3ee;
-        line-height: 1.1;
-        margin: 0;
-        text-align: center;
-    }
-    .hero-sub {
-        font-size: 2.9rem;
-        font-weight: 800;
-        color: #f8fafc;
-        line-height: 1.15;
-        margin: 0 0 0.75rem 0;
-        text-align: center;
-    }
-    .hero-meta {
-        font-family: monospace;
-        color: #94a3b8;
-        font-size: 0.9rem;
-        text-align: center;
-        margin-bottom: 1.8rem;
-    }
-    .kpi-box {
-        text-align: center;
-        padding: 0.5rem 1rem;
-    }
-    .kpi-val {
-        font-size: 2.1rem;
-        font-weight: 800;
-        color: #f8fafc;
-    }
-    .kpi-val-red {
-        font-size: 2.1rem;
-        font-weight: 800;
-        color: #f87171;
-    }
-    .kpi-lbl {
-        font-family: monospace;
-        font-size: 0.78rem;
-        color: #64748b;
-        margin-top: 0.15rem;
-    }
-    .pill-row {
-        display: flex;
-        flex-wrap: wrap;
-        justify-content: center;
-        gap: 8px;
-        margin-top: 1.2rem;
-    }
-    .plat-pill {
-        font-family: monospace;
-        font-size: 0.76rem;
-        padding: 4px 12px;
-        border-radius: 6px;
-        border: 1px solid rgba(255,255,255,0.12);
-    }
-    .subscore-card {
-        background: #11161f;
-        border: 1px solid #1e293b;
-        border-radius: 10px;
-        padding: 14px 18px;
-        margin-bottom: 12px;
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-    }
-    .sent-card-pos {
-        background: rgba(16, 185, 129, 0.08);
-        border: 1px solid rgba(16, 185, 129, 0.25);
-        border-radius: 10px;
-        padding: 20px;
-        text-align: center;
-    }
-    .sent-card-neg {
-        background: rgba(239, 68, 68, 0.08);
-        border: 1px solid rgba(239, 68, 68, 0.25);
-        border-radius: 10px;
-        padding: 20px;
-        text-align: center;
-    }
-    .sent-card-neu {
-        background: rgba(148, 163, 184, 0.08);
-        border: 1px solid rgba(148, 163, 184, 0.25);
-        border-radius: 10px;
-        padding: 20px;
-        text-align: center;
-    }
-    .thread-card {
-        background: #11161f;
-        border: 1px solid #1e293b;
-        border-radius: 10px;
-        padding: 16px;
-        margin-bottom: 10px;
-    }
-    .badge {
-        display: inline-block;
-        padding: 3px 10px;
-        border-radius: 6px;
-        font-family: monospace;
-        font-size: 0.78rem;
-        font-weight: 600;
-    }
-    .report-divider {
-        border: 0;
-        border-top: 1px solid #1e293b;
-        margin: 2.5rem 0;
-    }
+.stApp {
+    background-color: #0b0f14;
+    background-image:
+        linear-gradient(to right, rgba(255, 255, 255, 0.025) 1px, transparent 1px),
+        linear-gradient(to bottom, rgba(255, 255, 255, 0.025) 1px, transparent 1px);
+    background-size: 36px 36px;
+    color: #e6edf3;
+}
+section[data-testid="stSidebar"] {
+    background-color: #090c10;
+    border-right: 1px solid #1e2631;
+}
+.section-kicker {
+    font-family: monospace;
+    font-size: 0.78rem;
+    letter-spacing: 0.14em;
+    color: #22d3ee;
+    text-transform: uppercase;
+    margin-bottom: 0.25rem;
+}
+.hero-brand {
+    font-size: 3.1rem;
+    font-weight: 800;
+    color: #22d3ee;
+    line-height: 1.1;
+    margin: 0;
+    text-align: center;
+}
+.hero-sub {
+    font-size: 2.9rem;
+    font-weight: 800;
+    color: #f8fafc;
+    line-height: 1.15;
+    margin: 0 0 0.75rem 0;
+    text-align: center;
+}
+.hero-meta {
+    font-family: monospace;
+    color: #94a3b8;
+    font-size: 0.9rem;
+    text-align: center;
+    margin-bottom: 1.8rem;
+}
+.kpi-box {
+    text-align: center;
+    padding: 0.5rem 1rem;
+}
+.kpi-val {
+    font-size: 2.1rem;
+    font-weight: 800;
+    color: #f8fafc;
+}
+.kpi-val-red {
+    font-size: 2.1rem;
+    font-weight: 800;
+    color: #f87171;
+}
+.kpi-lbl {
+    font-family: monospace;
+    font-size: 0.78rem;
+    color: #64748b;
+    margin-top: 0.15rem;
+}
+.pill-row {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 8px;
+    margin-top: 1.2rem;
+}
+.plat-pill {
+    font-family: monospace;
+    font-size: 0.76rem;
+    padding: 4px 12px;
+    border-radius: 6px;
+    border: 1px solid rgba(255,255,255,0.12);
+}
+.subscore-card {
+    background: #11161f;
+    border: 1px solid #1e293b;
+    border-radius: 10px;
+    padding: 14px 18px;
+    margin-bottom: 12px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+.sent-card-pos {
+    background: rgba(16, 185, 129, 0.08);
+    border: 1px solid rgba(16, 185, 129, 0.25);
+    border-radius: 10px;
+    padding: 20px;
+    text-align: center;
+}
+.sent-card-neg {
+    background: rgba(239, 68, 68, 0.08);
+    border: 1px solid rgba(239, 68, 68, 0.25);
+    border-radius: 10px;
+    padding: 20px;
+    text-align: center;
+}
+.sent-card-neu {
+    background: rgba(148, 163, 184, 0.08);
+    border: 1px solid rgba(148, 163, 184, 0.25);
+    border-radius: 10px;
+    padding: 20px;
+    text-align: center;
+}
+.thread-card {
+    background: #11161f;
+    border: 1px solid #1e293b;
+    border-radius: 10px;
+    padding: 16px;
+    margin-bottom: 10px;
+}
+.badge {
+    display: inline-block;
+    padding: 3px 10px;
+    border-radius: 6px;
+    font-family: monospace;
+    font-size: 0.78rem;
+    font-weight: 600;
+}
+.report-divider {
+    border: 0;
+    border-top: 1px solid #1e293b;
+    margin: 2.5rem 0;
+}
 </style>
 """,
     unsafe_allow_html=True,
@@ -205,18 +204,17 @@ def render_donut_svg(score: int, subtitle: str = "Brand Health Score", size: int
     pct = max(0, min(100, score)) / 100.0
     offset = circumference * (1 - pct)
     ring_color = "#22d3ee" if score >= 55 else "#f59e0b" if score >= 35 else "#ef4444"
-    return f"""
-    <div style="display:flex;justify-content:center;align-items:center;margin:1rem 0;">
-      <svg width="{size}" height="{size}" viewBox="0 0 180 180">
-        <circle cx="90" cy="90" r="{radius}" fill="none" stroke="#1e293b" stroke-width="13" />
-        <circle cx="90" cy="90" r="{radius}" fill="none" stroke="{ring_color}" stroke-width="13"
-                stroke-dasharray="{circumference:.1f}" stroke-dashoffset="{offset:.1f}"
-                stroke-linecap="round" transform="rotate(-90 90 90)" />
-        <text x="90" y="88" text-anchor="middle" fill="#f8fafc" font-size="34" font-weight="800" font-family="sans-serif">{score}</text>
-        <text x="90" y="110" text-anchor="middle" fill="#94a3b8" font-size="11" font-family="monospace">{subtitle}</text>
-      </svg>
-    </div>
-    """
+    return (
+        f'<div style="display:flex;justify-content:center;align-items:center;margin:1rem 0;">'
+        f'<svg width="{size}" height="{size}" viewBox="0 0 180 180">'
+        f'<circle cx="90" cy="90" r="{radius}" fill="none" stroke="#1e293b" stroke-width="13" />'
+        f'<circle cx="90" cy="90" r="{radius}" fill="none" stroke="{ring_color}" stroke-width="13" '
+        f'stroke-dasharray="{circumference:.1f}" stroke-dashoffset="{offset:.1f}" '
+        f'stroke-linecap="round" transform="rotate(-90 90 90)" />'
+        f'<text x="90" y="88" text-anchor="middle" fill="#f8fafc" font-size="34" font-weight="800" font-family="sans-serif">{score}</text>'
+        f'<text x="90" y="110" text-anchor="middle" fill="#94a3b8" font-size="11" font-family="monospace">{subtitle}</text>'
+        f'</svg></div>'
+    )
 
 
 def generate_with_resilience(
@@ -287,7 +285,6 @@ def crawl_homepage(url: str) -> dict:
 
 
 def collect_live_mentions(brand: str, domain: str, category: str, market: str) -> dict:
-    """Queries live DuckDuckGo web & news indices across all 9 channels at $0 cost."""
     region_map = {
         "India": "in-en",
         "United States": "us-en",
@@ -300,28 +297,21 @@ def collect_live_mentions(brand: str, domain: str, category: str, market: str) -
     evidence = {ch[0]: [] for ch in CHANNELS}
 
     with DDGS() as ddgs:
-        # Web general mentions
         try:
-            web_hits = list(ddgs.text(f'"{brand}" OR "{domain}"', region=region, max_results=12))
-            evidence["Web"] = web_hits
+            evidence["Web"] = list(ddgs.text(f'"{brand}" OR "{domain}"', region=region, max_results=12))
         except Exception:
             pass
 
-        # News mentions
         try:
-            news_hits = list(ddgs.news(f'"{brand}"', region=region, max_results=8))
-            evidence["News"] = news_hits
+            evidence["News"] = list(ddgs.news(f'"{brand}"', region=region, max_results=8))
         except Exception:
             pass
 
-        # Social & Review Platforms
         for name, site_filter, _ in CHANNELS:
             if name in ("Web", "News"):
                 continue
             try:
-                q = f'"{brand}" {site_filter}'
-                hits = list(ddgs.text(q, region=region, max_results=6))
-                evidence[name] = hits
+                evidence[name] = list(ddgs.text(f'"{brand}" {site_filter}', region=region, max_results=6))
             except Exception:
                 evidence[name] = []
 
@@ -335,7 +325,6 @@ def run_brand_intelligence_pipeline(
     market: str,
     competitors_override: list[str],
 ) -> dict:
-    # Call 1: Identify exact brand entity, category & competitors
     entity_prompt = f"""
 Identify the brand entity, industry category, and 3 direct competitors in {market} from this homepage:
 Domain: {crawl_data['domain']}
@@ -362,10 +351,8 @@ Return strict JSON:
     entity = safe_json_loads(ent_resp.text)
     brand = entity["brand_name"]
 
-    # Step 2: Live multi-channel search harvest
     raw_evidence = collect_live_mentions(brand, crawl_data["domain"], entity["category"], market)
 
-    # Compact digest of live snippets for Gemini synthesis
     compact_evidence = {}
     for ch, items in raw_evidence.items():
         compact_evidence[ch] = [
@@ -377,7 +364,6 @@ Return strict JSON:
             for it in items[:6]
         ]
 
-    # Call 2: Full 11-Section Brand Intelligence & AEO Synthesis
     synthesis_prompt = f"""
 You are a senior Brand Intelligence & Answer Engine Optimization (AEO) analyst generating an executive report in the style of Novastacks AI.
 Brand: {brand} ({crawl_data['domain']})
@@ -409,7 +395,6 @@ Return strict JSON with these exact keys:
       "conversation_type": "Debate / Mixed | Question driven | Not applicable | Polarized | Mostly positive | Brand / Trade | Brand owned | Industry / Partner",
       "note": "concise note"
     }}
-    // include all 9 platforms in order: Reddit, Quora, G2, Web, News, X, YouTube, Facebook, Instagram
   ],
   "sentiment": {{
     "headline": "2-4 word punchy headline e.g. A Polarized Conversation or Strong Niche Advocacy",
@@ -481,23 +466,21 @@ with st.sidebar:
 
     st.divider()
     st.markdown(
-        """
-        <div style="font-family:monospace;font-size:0.8rem;line-height:2.0;color:#94a3b8;">
-        <div style="color:#22d3ee;font-weight:700;">REPORT SECTIONS</div>
-        <a href="#cover" style="color:#cbd5e1;text-decoration:none;">Cover</a><br>
-        <a href="#01-executive-summary" style="color:#cbd5e1;text-decoration:none;">01 Executive Summary</a><br>
-        <a href="#02-brand-health-score" style="color:#cbd5e1;text-decoration:none;">02 Brand Health Score</a><br>
-        <a href="#03-channel-overview" style="color:#cbd5e1;text-decoration:none;">03 Channel Overview</a><br>
-        <a href="#04-sentiment-analysis" style="color:#cbd5e1;text-decoration:none;">04 Sentiment Analysis</a><br>
-        <a href="#05-news-media-coverage" style="color:#cbd5e1;text-decoration:none;">05 News &amp; Media Coverage</a><br>
-        <a href="#06-competitor-landscape" style="color:#cbd5e1;text-decoration:none;">06 Competitor Landscape</a><br>
-        <a href="#07-top-pain-points" style="color:#cbd5e1;text-decoration:none;">07 Top Pain Points</a><br>
-        <div style="color:#475569;font-size:0.7rem;margin-top:8px;">PLAYBOOK &amp; STRATEGY</div>
-        <a href="#08-full-thread-analysis" style="color:#cbd5e1;text-decoration:none;">08 Full Thread Analysis</a><br>
-        <a href="#09-response-playbook" style="color:#cbd5e1;text-decoration:none;">09 Response Playbook</a><br>
-        <a href="#10-content-strategy" style="color:#cbd5e1;text-decoration:none;">10 Content Strategy</a>
-        </div>
-        """,
+        '<div style="font-family:monospace;font-size:0.8rem;line-height:2.0;color:#94a3b8;">'
+        '<div style="color:#22d3ee;font-weight:700;">REPORT SECTIONS</div>'
+        '<a href="#cover" style="color:#cbd5e1;text-decoration:none;">Cover</a><br>'
+        '<a href="#01-executive-summary" style="color:#cbd5e1;text-decoration:none;">01 Executive Summary</a><br>'
+        '<a href="#02-brand-health-score" style="color:#cbd5e1;text-decoration:none;">02 Brand Health Score</a><br>'
+        '<a href="#03-channel-overview" style="color:#cbd5e1;text-decoration:none;">03 Channel Overview</a><br>'
+        '<a href="#04-sentiment-analysis" style="color:#cbd5e1;text-decoration:none;">04 Sentiment Analysis</a><br>'
+        '<a href="#05-news-media-coverage" style="color:#cbd5e1;text-decoration:none;">05 News &amp; Media Coverage</a><br>'
+        '<a href="#06-competitor-landscape" style="color:#cbd5e1;text-decoration:none;">06 Competitor Landscape</a><br>'
+        '<a href="#07-top-pain-points" style="color:#cbd5e1;text-decoration:none;">07 Top Pain Points</a><br>'
+        '<div style="color:#475569;font-size:0.7rem;margin-top:8px;">PLAYBOOK &amp; STRATEGY</div>'
+        '<a href="#08-full-thread-analysis" style="color:#cbd5e1;text-decoration:none;">08 Full Thread Analysis</a><br>'
+        '<a href="#09-response-playbook" style="color:#cbd5e1;text-decoration:none;">09 Response Playbook</a><br>'
+        '<a href="#10-content-strategy" style="color:#cbd5e1;text-decoration:none;">10 Content Strategy</a>'
+        '</div>',
         unsafe_allow_html=True,
     )
 
@@ -614,18 +597,12 @@ with col_cards:
         sc = obj.get("score", 50)
         sc_color = "#34d399" if sc >= 70 else "#facc15" if sc >= 45 else "#f87171"
         st.markdown(
-            f"""
-            <div class="subscore-card">
-                <div>
-                    <div style="color:#94a3b8;font-size:0.85rem;">{label}</div>
-                    <div style="font-size:1.35rem;font-weight:800;color:{sc_color};">{sc} <span style="font-size:0.85rem;color:#64748b;">/ 100</span></div>
-                </div>
-                <div style="text-align:right;">
-                    <div style="font-family:monospace;font-size:0.8rem;color:#eab308;">{obj.get('weight', '')} weight</div>
-                    <div style="font-size:0.8rem;color:#64748b;">{obj.get('detail', '')}</div>
-                </div>
-            </div>
-            """,
+            f'<div class="subscore-card">'
+            f'<div><div style="color:#94a3b8;font-size:0.85rem;">{label}</div>'
+            f'<div style="font-size:1.35rem;font-weight:800;color:{sc_color};">{sc} <span style="font-size:0.85rem;color:#64748b;">/ 100</span></div></div>'
+            f'<div style="text-align:right;"><div style="font-family:monospace;font-size:0.8rem;color:#eab308;">{obj.get("weight", "")} weight</div>'
+            f'<div style="font-size:0.8rem;color:#64748b;">{obj.get("detail", "")}</div></div>'
+            f'</div>',
             unsafe_allow_html=True,
         )
 
@@ -647,41 +624,42 @@ badge_styles = {
     "Industry / Partner": ("rgba(16,185,129,0.16)", "#34d399"),
 }
 
-table_html = """
-<table style="width:100%;border-collapse:collapse;background:#11161f;border-radius:10px;overflow:hidden;border:1px solid #1e293b;">
-  <thead>
-    <tr style="border-bottom:1px solid #1e293b;text-align:left;font-family:monospace;font-size:0.78rem;color:#64748b;">
-      <th style="padding:14px 18px;">PLATFORM</th>
-      <th style="padding:14px 18px;text-align:center;">MENTIONS</th>
-      <th style="padding:14px 18px;">CONVERSATION TYPE</th>
-      <th style="padding:14px 18px;">NOTE</th>
-    </tr>
-  </thead>
-  <tbody>
-"""
+rows_html = []
 for ch in channels:
     plat = ch.get("platform", "")
     _, p_color = pill_colors.get(plat, ("", "#22d3ee"))
     ctype = ch.get("conversation_type", "Question driven")
     b_bg, b_fg = badge_styles.get(ctype, ("rgba(148,163,184,0.16)", "#cbd5e1"))
-    table_html += f"""
-    <tr style="border-bottom:1px solid #1a2230;">
-      <td style="padding:14px 18px;font-weight:700;color:{p_color};font-family:monospace;">{plat}</td>
-      <td style="padding:14px 18px;text-align:center;font-weight:700;color:#f8fafc;">{ch.get('mentions', 0)}</td>
-      <td style="padding:14px 18px;"><span class="badge" style="background:{b_bg};color:{b_fg};">{ctype}</span></td>
-      <td style="padding:14px 18px;color:#94a3b8;font-size:0.88rem;">{ch.get('note', '')}</td>
-    </tr>
-    """
-table_html += f"""
-    <tr style="background:#0d1219;">
-      <td style="padding:14px 18px;font-weight:800;color:#f8fafc;font-family:monospace;">Total analyzed</td>
-      <td style="padding:14px 18px;text-align:center;font-weight:800;color:#22d3ee;">{total_mentions}</td>
-      <td></td>
-      <td></td>
-    </tr>
-  </tbody>
-</table>
-"""
+    note_txt = ch.get("note", "")
+    mentions_val = ch.get("mentions", 0)
+    rows_html.append(
+        f'<tr style="border-bottom:1px solid #1a2230;">'
+        f'<td style="padding:14px 18px;font-weight:700;color:{p_color};font-family:monospace;">{plat}</td>'
+        f'<td style="padding:14px 18px;text-align:center;font-weight:700;color:#f8fafc;">{mentions_val}</td>'
+        f'<td style="padding:14px 18px;"><span class="badge" style="background:{b_bg};color:{b_fg};">{ctype}</span></td>'
+        f'<td style="padding:14px 18px;color:#94a3b8;font-size:0.88rem;">{note_txt}</td>'
+        f'</tr>'
+    )
+
+table_html = (
+    '<table style="width:100%;border-collapse:collapse;background:#11161f;border-radius:10px;overflow:hidden;border:1px solid #1e293b;">'
+    '<thead>'
+    '<tr style="border-bottom:1px solid #1e293b;text-align:left;font-family:monospace;font-size:0.78rem;color:#64748b;">'
+    '<th style="padding:14px 18px;">PLATFORM</th>'
+    '<th style="padding:14px 18px;text-align:center;">MENTIONS</th>'
+    '<th style="padding:14px 18px;">CONVERSATION TYPE</th>'
+    '<th style="padding:14px 18px;">NOTE</th>'
+    '</tr>'
+    '</thead>'
+    '<tbody>'
+    + "".join(rows_html)
+    + f'<tr style="background:#0d1219;">'
+    f'<td style="padding:14px 18px;font-weight:800;color:#f8fafc;font-family:monospace;">Total analyzed</td>'
+    f'<td style="padding:14px 18px;text-align:center;font-weight:800;color:#22d3ee;">{total_mentions}</td>'
+    f'<td></td><td></td>'
+    f'</tr>'
+    '</tbody></table>'
+)
 st.markdown(table_html, unsafe_allow_html=True)
 
 st.markdown('<hr class="report-divider">', unsafe_allow_html=True)
@@ -705,15 +683,13 @@ with sc3:
     st.markdown(f'<div class="sent-card-neu"><div style="font-family:monospace;font-size:0.75rem;color:#94a3b8;">NEUTRAL</div><div style="font-size:2.2rem;font-weight:800;color:#e2e8f0;">{neu_p}%</div></div>', unsafe_allow_html=True)
 
 st.markdown(
-    f"""
-    <div style="margin:1.4rem 0 0.5rem 0;font-family:monospace;font-size:0.75rem;color:#64748b;">OVERALL SENTIMENT DISTRIBUTION</div>
-    <div style="display:flex;width:100%;height:26px;border-radius:6px;overflow:hidden;font-family:monospace;font-size:0.75rem;font-weight:700;">
-      <div style="width:{pos_p}%;background:#22c55e;color:#052e16;display:flex;align-items:center;justify-content:center;">{pos_p}%</div>
-      <div style="width:{neg_p}%;background:#ef4444;color:#fff;display:flex;align-items:center;justify-content:center;">{neg_p}%</div>
-      <div style="width:{neu_p}%;background:#64748b;color:#fff;display:flex;align-items:center;justify-content:center;">{neu_p}%</div>
-    </div>
-    <p style="color:#94a3b8;font-size:0.92rem;margin-top:0.9rem;">{sent.get('narrative', '')}</p>
-    """,
+    f'<div style="margin:1.4rem 0 0.5rem 0;font-family:monospace;font-size:0.75rem;color:#64748b;">OVERALL SENTIMENT DISTRIBUTION</div>'
+    f'<div style="display:flex;width:100%;height:26px;border-radius:6px;overflow:hidden;font-family:monospace;font-size:0.75rem;font-weight:700;">'
+    f'<div style="width:{pos_p}%;background:#22c55e;color:#052e16;display:flex;align-items:center;justify-content:center;">{pos_p}%</div>'
+    f'<div style="width:{neg_p}%;background:#ef4444;color:#fff;display:flex;align-items:center;justify-content:center;">{neg_p}%</div>'
+    f'<div style="width:{neu_p}%;background:#64748b;color:#fff;display:flex;align-items:center;justify-content:center;">{neu_p}%</div>'
+    f'</div>'
+    f'<p style="color:#94a3b8;font-size:0.92rem;margin-top:0.9rem;">{sent.get("narrative", "")}</p>',
     unsafe_allow_html=True,
 )
 
