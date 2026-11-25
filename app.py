@@ -299,7 +299,6 @@ def estimate_domain_authority_1000(url: str) -> tuple[str, int]:
 
 def normalize_url(raw_url: str) -> str:
     raw_url = raw_url.strip()
-    # Strip accidental markdown link formatting [label](url)
     md_match = re.match(r"^\[.*?\]\((https?://.*?)\)$", raw_url)
     if md_match:
         raw_url = md_match.group(1).strip()
@@ -586,20 +585,15 @@ def collect_live_mentions_novastacks_scale(
         "Instagram": ["instagram.com"],
     }
 
-    def is_relevant(title: str, snippet: str, url: str, strict: bool = True) -> bool:
+    def is_relevant(title: str, snippet: str, url: str, strict: bool = True, exact_brand_only: bool = False) -> bool:
         hay = f"{title} {snippet} {url}".lower()
-        # Always accept domain or long domain stem
-        if domain.lower() in hay or (len(domain_stem) >= 5 and domain_stem in hay):
+        if domain.lower() in hay or (len(domain_stem) >= 6 and domain_stem in hay):
             return True
-        # Accept multi-word or >=5 char brand names
         if len(clean_brand) >= 5 and clean_brand.lower() in hay:
             return True
-        # For explicit brand queries on longer brands, trust search engine ranking if not strict
-        if not strict and len(clean_brand) >= 5:
-            return True
-        # Keyword check (also matches individual significant tokens of brand_name)
-        brand_tokens = [t.lower() for t in clean_brand.split() if len(t) >= 4]
-        if any(tok in hay for tok in brand_tokens):
+        if exact_brand_only:
+            return False
+        if not strict and len(clean_brand) >= 6:
             return True
         if rel_keywords and any(kw in hay for kw in rel_keywords):
             return True
@@ -612,6 +606,7 @@ def collect_live_mentions_novastacks_scale(
         required_domains: list[str] | None = None,
         exclude_own_domain: bool = False,
         strict_relevance: bool = True,
+        exact_brand_only: bool = False,
     ):
         telemetry[channel_name]["raw"] += len(raw_list)
         target_bucket = evidence[channel_name]
@@ -621,12 +616,11 @@ def collect_live_mentions_novastacks_scale(
             u = it.get("href") or it.get("url") or ""
             if not u or u in seen_urls:
                 continue
-            # Exact hostname/subdomain match (prevents 'x.com' from matching 'netflix.com')
             if required_domains and not host_matches_allowed(u, required_domains):
                 continue
             title_txt = it.get("title", "").strip()
             snip_txt = (it.get("body") or it.get("snippet") or "").strip()[:180]
-            if not is_relevant(title_txt, snip_txt, u, strict=strict_relevance):
+            if not is_relevant(title_txt, snip_txt, u, strict=strict_relevance, exact_brand_only=exact_brand_only):
                 continue
             dom, da = estimate_domain_authority_1000(u)
             if exclude_own_domain and (dom == domain.lower() or dom.endswith("." + domain.lower())):
@@ -663,7 +657,7 @@ def collect_live_mentions_novastacks_scale(
                 if res:
                     return res
         except Exception as e:
-            msg = f"DDGS web blocked on cloud IP: {str(e)[:90]}"
+            msg = f"DDGS web: {str(e)[:90]}"
             if msg not in diag["errors"]:
                 diag["errors"].append(msg)
         return []
@@ -673,12 +667,18 @@ def collect_live_mentions_novastacks_scale(
         if name in ("Web", "News"):
             continue
         req_doms = domain_matchers.get(name)
+        is_g2 = name == "G2"
 
-        # Pass 1: Direct brand query (relaxed relevance since brand was explicitly queried)
-        r1 = run_web_query(f"{clean_brand} {site_filter}", cap, include_domains=req_doms)
-        ingest(name, r1, cap, required_domains=req_doms, strict_relevance=False)
+        # Pass 1: Direct quoted brand query (require exact brand/domain match on G2 to prevent software false positives)
+        r1 = run_web_query(f'"{clean_brand}" {site_filter}', cap, include_domains=req_doms)
+        ingest(name, r1, cap, required_domains=req_doms, strict_relevance=is_g2, exact_brand_only=is_g2)
 
-        # Pass 2: Category debate query on Reddit & Quora (strict relevance)
+        # Pass 2: Domain-stem query for X/Facebook/Reddit/Quora if still below cap
+        if not is_g2 and len(evidence[name]) < cap and len(domain_stem) >= 6:
+            r1b = run_web_query(f"{domain_stem} {site_filter}", cap, include_domains=req_doms)
+            ingest(name, r1b, cap, required_domains=req_doms, strict_relevance=True)
+
+        # Pass 3: Category debate query on Reddit & Quora
         if name in ("Reddit", "Quora") and len(evidence[name]) < cap and clean_cat.lower() != clean_brand.lower():
             r2 = run_web_query(f"{clean_cat} {site_filter}", cap, include_domains=req_doms)
             ingest(name, r2, cap, required_domains=req_doms, strict_relevance=True)
@@ -712,12 +712,11 @@ def collect_live_mentions_novastacks_scale(
         if len(evidence["News"]) < 25:
             ingest("News", search_google_news_rss(clean_brand, gl=gl_up, max_res=30), 50, strict_relevance=False)
 
-    # 3. General Web (100 target)
-    excl = "-site:reddit.com -site:quora.com -site:youtube.com -site:facebook.com -site:instagram.com -site:x.com"
-    w1 = run_web_query(f"{clean_brand} {excl}", 60)
+    # 3. General Web (100 target — clean queries without chained -site: operators)
+    w1 = run_web_query(f'"{clean_brand}"', 60)
     ingest("Web", w1, 100, exclude_own_domain=True, strict_relevance=False)
     if len(evidence["Web"]) < 100 and clean_cat.lower() != clean_brand.lower():
-        w2 = run_web_query(f"{clean_cat} {excl}", 60)
+        w2 = run_web_query(clean_cat, 60)
         ingest("Web", w2, 100, exclude_own_domain=True, strict_relevance=True)
 
     if len(evidence["Web"]) == 0 and not serper_key and not tavily_key:
@@ -965,7 +964,7 @@ with st.sidebar:
     serper_key = st.secrets.get("SERPER_API_KEY", "") if hasattr(st, "secrets") else ""
     tavily_key = st.secrets.get("TAVILY_API_KEY", "") if hasattr(st, "secrets") else ""
     if not serper_key and not tavily_key:
-        with st.expander("🔍 Search API Key (Fixes Cloud IP 0s)", expanded=True):
+        with st.expander("🔍 Search API Key (Boosts Volume to 300+)", expanded=False):
             serper_key = st.text_input(
                 "Serper.dev API Key (Recommended)",
                 type="password",
@@ -1067,11 +1066,10 @@ neg_share = sent.get("negative_pct", 0)
 health_score = report["brand_health_score"]
 search_diag = report.get("search_diag", {})
 
-if search_diag.get("errors"):
+if search_diag.get("errors") and total_mentions == 0:
     st.warning(
         f"**Search Engine Notice ({search_diag.get('engine')}):** `{search_diag['errors'][0]}` — "
-        "Streamlit Cloud's shared AWS IP is blocked by free web scrapers for `site:reddit.com` / `site:quora.com`. "
-        "Paste a free **Serper.dev API key** in the sidebar to populate all 9 platforms."
+        "Add a free **Serper.dev API key** (2,500 free Google searches) in the sidebar to populate all 9 platforms."
     )
 
 pill_colors = {
