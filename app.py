@@ -199,17 +199,22 @@ CHANNELS = [
 
 KNOWN_AUTHORITY_1000 = {
     "nytimes.com": 940,
+    "yahoo.com": 930,
+    "finance.yahoo.com": 930,
     "forbes.com": 920,
     "bloomberg.com": 915,
     "reuters.com": 910,
     "economictimes.indiatimes.com": 820,
+    "brandequity.economictimes.indiatimes.com": 820,
     "indiatimes.com": 780,
     "hindustantimes.com": 760,
     "livemint.com": 750,
     "moneycontrol.com": 745,
     "business-standard.com": 720,
+    "gqindia.com": 680,
     "yourstory.com": 670,
     "inc42.com": 660,
+    "mensxp.com": 640,
     "prnewswire.com": 640,
     "businesswire.com": 635,
     "wwd.com": 610,
@@ -228,6 +233,13 @@ KNOWN_AUTHORITY_1000 = {
     "wikipedia.org": 970,
     "amazon.in": 880,
     "amazon.com": 950,
+    "blinkit.com": 760,
+}
+
+STOPWORDS = {
+    "the", "and", "for", "with", "from", "your", "our", "all", "new", "best",
+    "official", "store", "site", "website", "home", "page", "india", "indian",
+    "online", "buy", "shop", "com", "www", "http", "https", "in", "co",
 }
 
 
@@ -250,7 +262,7 @@ def estimate_domain_authority_1000(url: str) -> tuple[str, int]:
     score = 260
     if netloc.endswith((".gov", ".gov.in", ".edu", ".ac.in", ".org")):
         score += 180
-    elif any(k in netloc for k in ["news", "times", "post", "journal", "tribune", "daily", "magazine", "wire"]):
+    elif any(k in netloc for k in ["news", "times", "post", "journal", "tribune", "daily", "magazine", "wire", "spotlight", "equity"]):
         score += 210
     elif any(k in netloc for k in ["blog", "wordpress", "blogspot", "medium", "substack"]):
         score += 70
@@ -266,22 +278,43 @@ def normalize_url(raw_url: str) -> str:
     return raw_url
 
 
-def infer_brand_from_crawl(crawl_data: dict) -> str:
-    """Extracts clean brand name locally without burning an extra LLM call."""
-    og_site = crawl_data.get("og_site_name", "").strip()
-    if og_site and len(og_site) < 45:
-        return og_site
+def infer_brand_and_context(crawl_data: dict) -> tuple[str, list[str]]:
+    """Extracts the exact brand name AND 2-3 context keywords from the page to prevent false-positive search matches."""
     title = crawl_data.get("title", "")
-    if title:
+    og_site = crawl_data.get("og_site_name", "").strip()
+    brand = ""
+
+    if og_site and 2 <= len(og_site) <= 40:
+        brand = og_site
+    elif title:
         for sep in [" | ", " - ", " – ", " — ", ": "]:
             if sep in title:
                 parts = [p.strip() for p in title.split(sep) if p.strip()]
-                # Usually shortest clean segment is the brand name
+                # Prefer the first segment (usually brand name before tagline)
+                if 2 <= len(parts[0]) <= 35:
+                    brand = parts[0]
+                    break
                 candidate = min(parts, key=len)
-                if 2 <= len(candidate) <= 40:
-                    return candidate
-    root = crawl_data["domain"].split(".")[0]
-    return root.replace("-", " ").title()
+                if 2 <= len(candidate) <= 35:
+                    brand = candidate
+                    break
+
+    if not brand:
+        root = crawl_data["domain"].split(".")[0]
+        brand = root.replace("-", " ").title()
+
+    # Extract meaningful context tokens from title + meta description (e.g., skincare, haircare, grooming, diamond)
+    raw_context_text = f"{title} {crawl_data.get('meta_description', '')}".lower()
+    tokens = re.findall(r"[a-z]{4,}", raw_context_text)
+    brand_lower_tokens = set(re.findall(r"[a-z]{2,}", brand.lower()))
+    context_words = []
+    for tok in tokens:
+        if tok not in STOPWORDS and tok not in brand_lower_tokens and tok not in context_words:
+            context_words.append(tok)
+        if len(context_words) >= 4:
+            break
+
+    return brand, context_words
 
 
 def safe_json_loads(raw_text: str) -> dict:
@@ -331,7 +364,6 @@ def generate_with_resilience(
             err_msg = str(err)
             errors_seen.append(f"{model_id}: {err_msg[:180]}")
             upper = err_msg.upper()
-            # If transient 503 or 429 per-minute spike, pause briefly before trying next model
             if any(k in upper for k in ["503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED"]):
                 time.sleep(3)
                 continue
@@ -384,7 +416,8 @@ def crawl_homepage(url: str) -> dict:
     }
 
 
-def collect_live_mentions(brand: str, domain: str, market: str) -> dict:
+def collect_live_mentions(brand: str, domain: str, context_words: list[str], market: str) -> dict:
+    """Pulls context-anchored, deduplicated mentions and filters out unrelated homonyms."""
     region_map = {
         "India": "in-en",
         "United States": "us-en",
@@ -396,6 +429,27 @@ def collect_live_mentions(brand: str, domain: str, market: str) -> dict:
     region = region_map.get(market, "wt-wt")
     evidence = {ch[0]: [] for ch in CHANNELS}
     seen_urls = set()
+    domain_stem = domain.split(".")[0].lower()
+
+    # Build a disambiguated query so short brands (like "H.I.M") don't pull unrelated entities
+    if len(brand) <= 5 and context_words:
+        anchor_clause = " OR ".join(f'"{w}"' for w in context_words[:3])
+        base_query = f'("{domain}" OR ("{brand}" ({anchor_clause})))'
+    else:
+        base_query = f'("{brand}" OR "{domain}")'
+
+    def is_relevant(title: str, snippet: str, url: str) -> bool:
+        haystack = f"{title} {snippet} {url}".lower()
+        # Always accept if exact domain or domain stem appears
+        if domain.lower() in haystack or (len(domain_stem) >= 5 and domain_stem in haystack):
+            return True
+        # Otherwise require brand name AND at least one context keyword if brand is short/ambiguous
+        brand_hit = brand.lower() in haystack
+        if not brand_hit:
+            return False
+        if len(brand) <= 5 and context_words:
+            return any(w.lower() in haystack for w in context_words)
+        return True
 
     def dedup_and_enrich(raw_list: list[dict], exclude_own_domain: bool = False) -> list[dict]:
         cleaned = []
@@ -403,14 +457,18 @@ def collect_live_mentions(brand: str, domain: str, market: str) -> dict:
             u = it.get("href") or it.get("url") or ""
             if not u or u in seen_urls:
                 continue
+            title_txt = it.get("title", "").strip()
+            snip_txt = (it.get("body") or it.get("snippet") or "").strip()[:180]
+            if not is_relevant(title_txt, snip_txt, u):
+                continue
             dom, da = estimate_domain_authority_1000(u)
             if exclude_own_domain and domain.lower() in dom.lower():
                 continue
             seen_urls.add(u)
             cleaned.append(
                 {
-                    "title": it.get("title", "").strip(),
-                    "snippet": (it.get("body") or it.get("snippet") or "").strip()[:180],
+                    "title": title_txt,
+                    "snippet": snip_txt,
                     "url": u,
                     "domain": dom,
                     "authority_1000": da,
@@ -419,25 +477,29 @@ def collect_live_mentions(brand: str, domain: str, market: str) -> dict:
         return cleaned
 
     with DDGS() as ddgs:
+        # 1. Social & Forum channels
         for name, site_filter, _, limit in CHANNELS:
             if name in ("Web", "News"):
                 continue
             try:
-                raw = list(ddgs.text(f'"{brand}" {site_filter}', region=region, max_results=limit))
+                raw = list(ddgs.text(f"{base_query} {site_filter}", region=region, max_results=limit))
                 evidence[name] = dedup_and_enrich(raw)
             except Exception:
                 evidence[name] = []
 
+        # 2. News coverage (query both domain and anchored brand)
         try:
-            raw_news = list(ddgs.news(f'"{brand}"', region=region, max_results=18))
-            evidence["News"] = dedup_and_enrich(raw_news)
+            raw_news_1 = list(ddgs.news(f'"{domain}"', region=region, max_results=10))
+            raw_news_2 = list(ddgs.news(base_query, region=region, max_results=14))
+            evidence["News"] = dedup_and_enrich(raw_news_1 + raw_news_2)
         except Exception:
             evidence["News"] = []
 
+        # 3. General Web mentions (excluding social platforms already bucketed)
         try:
             raw_web = list(
                 ddgs.text(
-                    f'"{brand}" -site:reddit.com -site:quora.com -site:youtube.com -site:facebook.com -site:instagram.com -site:x.com',
+                    f"{base_query} -site:reddit.com -site:quora.com -site:youtube.com -site:facebook.com -site:instagram.com -site:x.com",
                     region=region,
                     max_results=30,
                 )
@@ -457,29 +519,29 @@ def run_brand_intelligence_pipeline(
     competitors_override: list[str],
     brand_override: str = "",
 ) -> dict:
-    # Step 1: Resolve brand name locally (0 LLM calls) and harvest live mentions
-    brand = brand_override.strip() or infer_brand_from_crawl(crawl_data)
-    evidence = collect_live_mentions(brand, crawl_data["domain"], market)
+    inferred_brand, context_words = infer_brand_and_context(crawl_data)
+    brand = brand_override.strip() or inferred_brand
+
+    evidence = collect_live_mentions(brand, crawl_data["domain"], context_words, market)
 
     actual_counts = {ch: len(items) for ch, items in evidence.items()}
     total_harvested = sum(actual_counts.values())
     active_channel_count = sum(1 for v in actual_counts.values() if v > 0)
 
-    web_items = evidence.get("Web", [])
+    web_items = evidence.get("Web", []) + evidence.get("News", [])
     avg_da = int(sum(x["authority_1000"] for x in web_items) / len(web_items)) if web_items else 280
 
     combined_authority_pool = sorted(
-        evidence.get("Web", []) + evidence.get("News", []),
+        web_items,
         key=lambda x: x["authority_1000"],
         reverse=True,
     )[:6]
 
-    # Keep digest compact (~2,200 tokens max) so Free Tier TPM never trips
     digest_for_llm = {
         ch: [
             {
-                "title": it["title"][:100],
-                "snippet": it["snippet"][:130],
+                "title": it["title"][:110],
+                "snippet": it["snippet"][:140],
                 "domain": it["domain"],
                 "da": it["authority_1000"],
             }
@@ -489,31 +551,35 @@ def run_brand_intelligence_pipeline(
         if items
     }
 
-    # Single Consolidated Gemini Call for Entity, Sentiment, Competitors & Strategy
     synthesis_prompt = f"""
 You are a senior Brand Intelligence & AEO analyst producing an executive report matching Novastacks AI's methodology.
 Brand Candidate: {brand} | Domain: {crawl_data['domain']} | Market: {market}
 Page Title: {crawl_data['title']} | Meta: {crawl_data['meta_description']}
-User Competitor Overrides: {competitors_override}
+Context Keywords: {context_words}
+User Competitor Overrides (ONLY use these if non-empty; otherwise infer actual category competitors for {crawl_data['domain']} in {market}): {competitors_override}
 Homepage Excerpt: {crawl_data['excerpt'][:900]}
 Actual Harvested Mention Counts: {json.dumps(actual_counts)} (Total: {total_harvested}, Active: {active_channel_count}/9)
-Average Web Source Domain Authority: {avg_da}/1000
+Average Source Domain Authority: {avg_da}/1000
 
-Live Harvested Evidence Sample:
+Live Harvested Evidence Sample (strictly filtered for {brand} / {crawl_data['domain']}):
 {json.dumps(digest_for_llm)}
 
-Return strict JSON grounded strictly in the evidence above:
+IMPORTANT RULES:
+- Every headline in "news_cards" and "top_authority_sentiments" MUST come strictly from the Live Harvested Evidence Sample above (or if fewer than 3 news items were found, summarize the actual web/press articles present in the sample—never invent unrelated stocks or companies).
+- If User Competitor Overrides is empty, identify 2-3 real direct competitors in {market} for {crawl_data['domain']}'s actual industry.
+
+Return strict JSON:
 {{
   "entity": {{
     "brand_name": "verified official brand name",
     "category": "concise category",
     "is_b2b_software": true or false,
     "direct_competitors": [
-      {{"domain": "competitor1.com", "type": "Branded retail / Direct SaaS / Marketplace", "summary": "1 sentence on how they compete"}}
+      {{"domain": "competitor1.com", "type": "Branded D2C / Direct SaaS / Marketplace", "summary": "1 sentence on how they compete"}}
     ],
     "category_pressure": {{
       "label": "Primary alternative/substitute category creating buyer skepticism",
-      "summary": "2 sentences explaining how this alternative drives negative/skeptical threads."
+      "summary": "2 sentences explaining how this alternative drives skeptical threads."
     }}
   }},
   "executive_summary": {{
@@ -535,7 +601,7 @@ Return strict JSON grounded strictly in the evidence above:
     }}
   ],
   "sentiment": {{
-    "headline": "2-4 word headline e.g. A Polarized Conversation",
+    "headline": "2-4 word headline e.g. Strong Launch Momentum",
     "intro": "2 sentence explanation of the sentiment classification.",
     "positive_pct": integer,
     "negative_pct": integer,
@@ -607,7 +673,7 @@ Return strict JSON grounded strictly in the evidence above:
 
     pos_pct = ai_out.get("sentiment", {}).get("positive_pct", 50)
     sent_score = max(0, min(100, int(pos_pct)))
-    vol_score = min(100, int((total_harvested / 110) * 100))
+    vol_score = min(100, int((total_harvested / 100) * 100))
     reach_score = min(100, int((avg_da / 1000) * 100))
     cov_score = int((active_channel_count / 9) * 100)
     fresh_score = max(0, min(100, int(ai_out.get("freshness_score", 55))))
@@ -677,14 +743,14 @@ with st.sidebar:
     if not api_key:
         api_key = st.text_input("Gemini API Key", type="password", help="Or set GEMINI_API_KEY in Streamlit Secrets")
 
-    target_url = st.text_input("Target Website URL", placeholder="[https://www.naturaldiamonds.com/in](https://www.naturaldiamonds.com/in)")
+    target_url = st.text_input("Target Website URL", placeholder="[https://himscience.com](https://himscience.com)")
     brand_override = st.text_input("Brand Name (optional)", placeholder="Auto-detected from site if blank")
     market = st.selectbox(
         "Target Market",
         ["India", "United States", "United Kingdom", "Singapore", "Australia", "Global"],
         index=0,
     )
-    comp_input = st.text_input("Direct Competitors (optional)", placeholder="tanishq.co.in, amazon.in")
+    comp_input = st.text_input("Direct Competitors (optional)", placeholder="Leave blank to auto-detect")
     model_name = st.selectbox("Model", MODEL_CANDIDATES, index=0)
     run_btn = st.button("Generate Full Report", type="primary", use_container_width=True)
 
