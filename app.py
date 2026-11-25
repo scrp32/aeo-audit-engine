@@ -186,7 +186,6 @@ MODEL_CANDIDATES = [
     "gemini-3.6-flash",
 ]
 
-# Matches Novastacks 310-mention channel caps
 CHANNELS = [
     ("Reddit", "site:reddit.com", "#f97316", 45),
     ("Quora", "site:quora.com", "#eab308", 45),
@@ -284,11 +283,9 @@ def normalize_url(raw_url: str) -> str:
 
 
 def humanize_domain_name(domain: str) -> str:
-    """Splits concatenated domains like naturaldiamondcouncil.com -> Natural Diamond Council."""
     stem = domain.lower().replace("www.", "").split(".")[0]
     if "-" in stem:
         return " ".join(w.capitalize() for w in stem.split("-") if w)
-    # Split common English words concatenated in domain names
     known_splits = {
         "naturaldiamondcouncil": "Natural Diamond Council",
         "naturaldiamonds": "Natural Diamonds",
@@ -357,7 +354,6 @@ def generate_with_resilience(
 
 
 def crawl_homepage_resilient(url: str) -> dict:
-    """Crawls homepage and gracefully degrades if Cloudflare/WAF blocks datacenter IPs."""
     parsed = urlparse(url)
     domain = parsed.netloc.lower().replace("www.", "")
     fallback_brand = humanize_domain_name(domain)
@@ -414,7 +410,6 @@ def resolve_brand_queries_via_llm(
     market: str,
     brand_override: str,
 ) -> dict:
-    """Fast tiny call (~250 tokens) to get exact brand name, search aliases & category queries even if WAF blocked HTML."""
     prompt = f"""
 Identify the brand and search queries for a Brand Intelligence & AEO audit.
 URL: {crawl_data['final_url']} | Domain: {crawl_data['domain']} | Market: {market}
@@ -463,7 +458,6 @@ def collect_live_mentions_novastacks_scale(
     domain: str,
     market: str,
 ) -> tuple[dict, list[str]]:
-    """Multi-query harvester matching Novastacks' 310-mention scale across 9 platforms."""
     region_map = {
         "India": "in-en",
         "United States": "us-en",
@@ -483,22 +477,44 @@ def collect_live_mentions_novastacks_scale(
     rel_keywords = [k.lower() for k in brand_meta.get("relevance_keywords", []) if len(k) >= 3]
     domain_stem = domain.split(".")[0].lower()
 
+    clean_brand = brand_name.replace('"', "").strip()
+    clean_cat = re.sub(r'["()]', "", cat_query).split(" OR ")[0].strip()
+
+    domain_matchers = {
+        "Reddit": ["reddit.com"],
+        "Quora": ["quora.com"],
+        "G2": ["g2.com"],
+        "X": ["x.com", "twitter.com"],
+        "YouTube": ["youtube.com", "youtu.be"],
+        "Facebook": ["facebook.com"],
+        "Instagram": ["instagram.com"],
+    }
+
     def is_relevant(title: str, snippet: str, url: str) -> bool:
         hay = f"{title} {snippet} {url}".lower()
         if domain.lower() in hay or (len(domain_stem) >= 5 and domain_stem in hay):
             return True
-        if len(brand_name) >= 5 and brand_name.lower() in hay:
+        if len(clean_brand) >= 4 and clean_brand.lower() in hay:
             return True
         if rel_keywords and any(kw in hay for kw in rel_keywords):
             return True
         return False
 
-    def ingest(raw_list: list[dict], target_bucket: list[dict], cap: int, exclude_own_domain: bool = False):
+    def ingest(
+        raw_list: list[dict],
+        target_bucket: list[dict],
+        cap: int,
+        required_domains: list[str] | None = None,
+        exclude_own_domain: bool = False,
+    ):
         for it in raw_list:
             if len(target_bucket) >= cap:
                 break
             u = it.get("href") or it.get("url") or ""
             if not u or u in seen_urls:
+                continue
+            u_low = u.lower()
+            if required_domains and not any(d in u_low for d in required_domains):
                 continue
             title_txt = it.get("title", "").strip()
             snip_txt = (it.get("body") or it.get("snippet") or "").strip()[:180]
@@ -518,55 +534,93 @@ def collect_live_mentions_novastacks_scale(
                 }
             )
 
-    def safe_ddgs_text(ddgs_client, query: str, max_res: int) -> list[dict]:
-        try:
-            time.sleep(0.35)
-            return list(ddgs_client.text(query, region=region, max_results=max_res))
-        except Exception as e:
-            msg = str(e)
-            if msg not in warnings:
-                warnings.append(msg[:140])
-            return []
+    def multi_backend_text(ddgs_client, query: str, max_res: int) -> list[dict]:
+        for bk in ["bing", "lite", "auto"]:
+            try:
+                time.sleep(0.25)
+                res = list(ddgs_client.text(query, region=region, backend=bk, max_results=max_res))
+                if res:
+                    return res
+            except Exception as e:
+                msg = f"{bk}: {str(e)[:100]}"
+                if msg not in warnings:
+                    warnings.append(msg)
+        return []
 
     def safe_ddgs_news(ddgs_client, query: str, max_res: int) -> list[dict]:
         try:
-            time.sleep(0.35)
+            time.sleep(0.25)
             return list(ddgs_client.news(query, region=region, max_results=max_res))
         except Exception as e:
-            msg = str(e)
+            msg = str(e)[:120]
             if msg not in warnings:
-                warnings.append(msg[:140])
+                warnings.append(msg)
+            return []
+
+    def fetch_reddit_direct_json(query: str, limit: int = 35) -> list[dict]:
+        try:
+            r = requests.get(
+                "[https://www.reddit.com/search.json](https://www.reddit.com/search.json)",
+                params={"q": query, "limit": limit, "sort": "relevance"},
+                headers={"User-Agent": "Mozilla/5.0 (compatible; BrandAuditBot/1.0)"},
+                timeout=10,
+            )
+            if r.status_code != 200:
+                return []
+            children = r.json().get("data", {}).get("children", [])
+            out = []
+            for ch in children:
+                d = ch.get("data", {})
+                permalink = d.get("permalink", "")
+                if permalink:
+                    out.append(
+                        {
+                            "title": d.get("title", ""),
+                            "body": (d.get("selftext") or d.get("subreddit_name_prefixed") or "")[:180],
+                            "href": f"[https://www.reddit.com](https://www.reddit.com){permalink}",
+                        }
+                    )
+            return out
+        except Exception:
             return []
 
     with DDGS() as ddgs:
         for name, site_filter, _, cap in CHANNELS:
             if name in ("Web", "News"):
                 continue
-            # Query 1: Exact brand on platform
-            r1 = safe_ddgs_text(ddgs, f"{brand_queries[0]} {site_filter}", cap)
-            ingest(r1, evidence[name], cap)
+            req_doms = domain_matchers.get(name)
 
-            # Query 2: For Reddit & Quora, also capture category/consumer questions like Novastacks does
-            if name in ("Reddit", "Quora") and len(evidence[name]) < cap:
-                r2 = safe_ddgs_text(ddgs, f"{cat_query} {site_filter}", cap - len(evidence[name]))
-                ingest(r2, evidence[name], cap)
-            elif len(brand_queries) > 1 and len(evidence[name]) < cap:
-                r2 = safe_ddgs_text(ddgs, f"{brand_queries[1]} {site_filter}", cap - len(evidence[name]))
-                ingest(r2, evidence[name], cap)
+            r1 = multi_backend_text(ddgs, f"{clean_brand} {site_filter}", cap)
+            ingest(r1, evidence[name], cap, required_domains=req_doms)
 
-        # News (50 target like Novastacks)
-        n1 = safe_ddgs_news(ddgs, brand_queries[0], 30)
+            if len(evidence[name]) < cap:
+                plat_word = "twitter" if name == "X" else name.lower()
+                r2 = multi_backend_text(ddgs, f"{clean_brand} {plat_word}", cap)
+                ingest(r2, evidence[name], cap, required_domains=req_doms)
+
+            if name in ("Reddit", "Quora") and len(evidence[name]) < cap and clean_cat.lower() != clean_brand.lower():
+                plat_word = name.lower()
+                r3 = multi_backend_text(ddgs, f"{clean_cat} {site_filter}", cap)
+                ingest(r3, evidence[name], cap, required_domains=req_doms)
+                if len(evidence[name]) < cap:
+                    r4 = multi_backend_text(ddgs, f"{clean_cat} {plat_word}", cap)
+                    ingest(r4, evidence[name], cap, required_domains=req_doms)
+
+        if len(evidence["Reddit"]) < 15:
+            ingest(fetch_reddit_direct_json(clean_brand, 30), evidence["Reddit"], 45, required_domains=["reddit.com"])
+            if len(evidence["Reddit"]) < 25 and clean_cat.lower() != clean_brand.lower():
+                ingest(fetch_reddit_direct_json(clean_cat, 30), evidence["Reddit"], 45, required_domains=["reddit.com"])
+
+        n1 = safe_ddgs_news(ddgs, clean_brand, 30)
         ingest(n1, evidence["News"], 50)
-        if len(evidence["News"]) < 50 and len(brand_queries) > 1:
-            n2 = safe_ddgs_news(ddgs, brand_queries[1], 25)
+        if len(evidence["News"]) < 50 and clean_cat.lower() != clean_brand.lower():
+            n2 = safe_ddgs_news(ddgs, clean_cat, 30)
             ingest(n2, evidence["News"], 50)
 
-        # General Web (100 target like Novastacks)
-        excl = "-site:reddit.com -site:quora.com -site:youtube.com -site:facebook.com -site:instagram.com -site:x.com"
-        w1 = safe_ddgs_text(ddgs, f"{brand_queries[0]} {excl}", 55)
+        w1 = multi_backend_text(ddgs, clean_brand, 60)
         ingest(w1, evidence["Web"], 100, exclude_own_domain=True)
-        if len(evidence["Web"]) < 100:
-            w2 = safe_ddgs_text(ddgs, f"{cat_query} {excl}", 50)
+        if len(evidence["Web"]) < 100 and clean_cat.lower() != clean_brand.lower():
+            w2 = multi_backend_text(ddgs, clean_cat, 60)
             ingest(w2, evidence["Web"], 100, exclude_own_domain=True)
 
     return evidence, warnings
@@ -580,11 +634,9 @@ def run_brand_intelligence_pipeline(
     competitors_override: list[str],
     brand_override: str = "",
 ) -> dict:
-    # Step 1: Resolve clean brand & disambiguated queries
     brand_meta = resolve_brand_queries_via_llm(client, model_name, crawl_data, market, brand_override)
     brand = brand_meta["brand_name"]
 
-    # Step 2: Harvest Novastacks-scale mentions across 9 platforms
     evidence, search_warnings = collect_live_mentions_novastacks_scale(brand_meta, crawl_data["domain"], market)
 
     actual_counts = {ch: len(items) for ch, items in evidence.items()}
@@ -889,7 +941,7 @@ health_score = report["brand_health_score"]
 if report.get("search_warnings") and total_mentions == 0:
     st.warning(
         f"Search engine rate-limit noticed on Streamlit Cloud IP: `{report['search_warnings'][0]}`. "
-        "Wait 30 seconds and click Generate Full Report again (or add a Serper/Tavily key for guaranteed datacenter search)."
+        "Wait 30 seconds and click Generate Full Report again."
     )
 
 pill_colors = {
