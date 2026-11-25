@@ -44,6 +44,15 @@ def normalize_url(raw_url: str) -> str:
     return raw_url
 
 
+def safe_json_loads(raw_text: str) -> dict:
+    """Strips optional markdown code fences before parsing JSON."""
+    cleaned = raw_text.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+    return json.loads(cleaned)
+
+
 def check_robots_and_llms(base_url: str) -> dict:
     parsed = urlparse(base_url)
     root = f"{parsed.scheme}://{parsed.netloc}"
@@ -139,7 +148,6 @@ def crawl_site(url: str) -> dict:
     schemas = extract_json_ld_types(soup)
     bots_and_llms = check_robots_and_llms(resp.url)
 
-    # Clean visible text
     for tag in soup(["script", "style", "noscript", "svg"]):
         tag.decompose()
     body_text = re.sub(r"\s+", " ", soup.get_text(" ", strip=True))
@@ -148,7 +156,6 @@ def crawl_site(url: str) -> dict:
     has_semantic_tags = bool(soup.find(["main", "article", "section"]))
     has_tables_or_lists = len(soup.find_all(["ul", "ol", "table"])) >= 2
 
-    # Deterministic AEO Readiness Score (0-100)
     score = 0
     breakdown = {}
 
@@ -199,11 +206,14 @@ def crawl_site(url: str) -> dict:
 
 def run_llm_and_serp_audit(
     client: genai.Client,
+    model_name: str,
     crawl_data: dict,
     market: str,
     competitors_override: list[str],
     concern: str,
 ) -> dict:
+    search_tool = types.Tool(google_search=types.GoogleSearch())
+
     # Step 1: Extract Brand Entity, Category, Competitors & Buyer Prompts
     discovery_prompt = f"""
 Analyze this crawled webpage and generate an AEO test plan for target market: {market}.
@@ -225,14 +235,14 @@ Return strict JSON with keys:
 - "core_keywords": list of 4 core commercial/informational Google search keywords for this business in {market}
 """
     plan_resp = client.models.generate_content(
-        model="gemini-2.5-flash",
+        model=model_name,
         contents=discovery_prompt,
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
             temperature=0.2,
         ),
     )
-    plan = json.loads(plan_resp.text)
+    plan = safe_json_loads(plan_resp.text)
 
     brand = plan["brand_name"]
     domain = crawl_data["domain"]
@@ -245,16 +255,15 @@ Return strict JSON with keys:
 
     for bp in plan["buyer_prompts"][:5]:
         live_resp = client.models.generate_content(
-            model="gemini-2.5-flash",
+            model=model_name,
             contents=f"Answer this user query thoroughly for someone in {market}, recommending specific brands, platforms, or providers where relevant:\n\n{bp}",
             config=types.GenerateContentConfig(
-                tools=[{"google_search": {}}],
+                tools=[search_tool],
                 temperature=0.3,
             ),
         )
         ans_text = live_resp.text or ""
 
-        # Extract grounded source URLs from metadata
         cited_urls = []
         cand = live_resp.candidates[0] if live_resp.candidates else None
         if cand and cand.grounding_metadata and cand.grounding_metadata.grounding_chunks:
@@ -310,15 +319,15 @@ Perform live Google searches for the core keywords and brand vs competitors in {
 4. "top_3_opportunities": list of 3 objects, each with "title", "impact" ("High" or "Critical"), "effort" ("Low", "Medium", "High"), and "action_plan" (concrete, non-generic steps tailored to {domain}).
 """
     synth_resp = client.models.generate_content(
-        model="gemini-2.5-flash",
+        model=model_name,
         contents=synthesis_prompt,
         config=types.GenerateContentConfig(
-            tools=[{"google_search": {}}],
+            tools=[search_tool],
             response_mime_type="application/json",
             temperature=0.2,
         ),
     )
-    synthesis = json.loads(synth_resp.text)
+    synthesis = safe_json_loads(synth_resp.text)
 
     return {
         "plan": plan,
@@ -342,6 +351,11 @@ with st.sidebar:
     if not api_key:
         api_key = st.text_input("Gemini API Key", type="password", help="Or set GEMINI_API_KEY in Streamlit Secrets")
 
+    model_name = st.selectbox(
+        "Gemini Model",
+        ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-3-flash-preview"],
+        index=0,
+    )
     market = st.selectbox(
         "Target Market",
         ["India", "United States", "United Kingdom", "Singapore", "United Arab Emirates", "Australia", "Global"],
@@ -359,7 +373,7 @@ with st.sidebar:
 
 col_url, col_btn = st.columns([4, 1])
 with col_url:
-    target_url = st.text_input("Website URL", placeholder="https://example.com", label_visibility="collapsed")
+    target_url = st.text_input("Website URL", placeholder="[https://example.com](https://example.com)", label_visibility="collapsed")
 with col_btn:
     run_audit = st.button("Run AEO Audit", type="primary", use_container_width=True)
 
@@ -387,6 +401,7 @@ if run_audit:
         try:
             audit_data = run_llm_and_serp_audit(
                 client=client,
+                model_name=model_name,
                 crawl_data=crawl_data,
                 market=market,
                 competitors_override=competitors_override,
@@ -404,16 +419,17 @@ if run_audit:
 
     st.divider()
     st.subheader(f"AEO Visibility Report: {plan['brand_name']} (`{crawl_data['domain']}`)")
-    st.caption(f"Category: **{plan['category']}** | Market: **{market}** | Benchmarked Competitors: **{', '.join(plan['competitors'])}**")
+    st.caption(
+        f"Category: **{plan['category']}** | Market: **{market}** | "
+        f"Benchmarked Competitors: **{', '.join(plan['competitors'])}**"
+    )
 
-    # Top KPI Strip
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("AEO Readiness Score", f"{crawl_data['readiness_score']}/100")
     m2.metric("LLM Brand Mentions", f"{audit_data['brand_mentions']} / 5 prompts")
     m3.metric("Direct Domain Citations", f"{audit_data['brand_citations']} / 5 prompts")
     m4.metric("Schemas Detected", f"{len(crawl_data['schemas_found'])}")
 
-    # Section 1: LLM Visibility Check
     st.markdown("### 1. LLM Visibility Check (Unbranded Buyer Prompts)")
     df_prompts = pd.DataFrame(audit_data["prompt_results"])
     st.dataframe(
@@ -429,11 +445,9 @@ if run_audit:
                 st.caption("Sources: " + " | ".join(row["Grounded Sources"]))
             st.divider()
 
-    # Section 2: Competitive Snapshot
     st.markdown("### 2. Competitive Snapshot")
     st.markdown(synth.get("competitive_snapshot", ""))
 
-    # Section 3: AEO Readiness Score & Crawler Access
     st.markdown("### 3. AEO Readiness Score & AI Bot Access")
     c_left, c_right = st.columns(2)
     with c_left:
@@ -449,12 +463,10 @@ if run_audit:
         )
         st.dataframe(bot_df, use_container_width=True, hide_index=True)
 
-    # Section 4: SERP & AI Overview Position Check
     st.markdown("### 4. SERP & Google AI Overview Position Check")
     if synth.get("serp_checks"):
         st.dataframe(pd.DataFrame(synth["serp_checks"]), use_container_width=True, hide_index=True)
 
-    # Section 5: Schema Gap Analysis
     st.markdown("### 5. Schema Gap Analysis")
     s1, s2 = st.columns(2)
     with s1:
@@ -464,14 +476,12 @@ if run_audit:
     for rec in synth.get("schema_recommendations", []):
         st.write(f"- {rec}")
 
-    # Section 6: Top 3 Opportunities
     st.markdown("### 6. Top 3 High-Impact AEO Opportunities")
     for idx, opp in enumerate(synth.get("top_3_opportunities", [])[:3], start=1):
         with st.container(border=True):
             st.markdown(f"**#{idx}: {opp.get('title')}** — Impact: `{opp.get('impact')}` | Effort: `{opp.get('effort')}`")
             st.write(opp.get("action_plan"))
 
-    # Downloadable Report Export
     report_payload = json.dumps(
         {"crawl_data": crawl_data, "audit_data": audit_data},
         indent=2,
