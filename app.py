@@ -1,4 +1,5 @@
 import datetime
+import html
 import json
 import re
 import time
@@ -141,8 +142,47 @@ section[data-testid="stSidebar"] {
     background: #11161f;
     border: 1px solid #1e293b;
     border-radius: 10px;
-    padding: 15px 18px;
+    padding: 16px 18px;
+    margin-bottom: 12px;
+}
+.thread-card:hover {
+    border-color: #334155;
+}
+.thread-title-link {
+    font-weight: 700;
+    font-size: 0.96rem;
+    color: #f8fafc !important;
+    text-decoration: none;
+    line-height: 1.4;
+    display: block;
+    margin-bottom: 6px;
+}
+.thread-title-link:hover {
+    color: #22d3ee !important;
+    text-decoration: underline;
+}
+.thread-snippet {
+    color: #94a3b8;
+    font-size: 0.85rem;
+    line-height: 1.5;
     margin-bottom: 10px;
+}
+.thread-footer {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    align-items: center;
+    gap: 8px;
+}
+.draft-reply-box {
+    background: #0b0f14;
+    border: 1px dashed #334155;
+    border-radius: 8px;
+    padding: 10px 14px;
+    margin-top: 10px;
+    color: #cbd5e1;
+    font-size: 0.84rem;
+    line-height: 1.5;
 }
 .pressure-box {
     background: rgba(239, 68, 68, 0.07);
@@ -159,7 +199,7 @@ section[data-testid="stSidebar"] {
     padding: 3px 10px;
     border-radius: 6px;
     font-family: monospace;
-    font-size: 0.76rem;
+    font-size: 0.74rem;
     font-weight: 600;
 }
 .report-divider {
@@ -249,7 +289,6 @@ BOT_BLOCK_MARKERS = [
 
 
 def extract_clean_host(url: str) -> str:
-    """Returns exact normalized hostname (e.g. 'x.com', 'netflix.com') so suffix checks don't false-match."""
     try:
         host = urlparse(url.strip()).netloc.lower()
         host = host.split(":")[0]
@@ -261,7 +300,6 @@ def extract_clean_host(url: str) -> str:
 
 
 def host_matches_allowed(url: str, allowed_domains: list[str]) -> bool:
-    """Exact domain or subdomain match: 'x.com' matches 'x.com' & 'mobile.x.com', NEVER 'netflix.com'."""
     host = extract_clean_host(url)
     if not host:
         return False
@@ -270,6 +308,43 @@ def host_matches_allowed(url: str, allowed_domains: list[str]) -> bool:
         if host == d_clean or host.endswith("." + d_clean):
             return True
     return False
+
+
+def clean_serp_title(title: str) -> str:
+    """Cleans noisy SERP concatenations like 'Title : r/Sub - RedditSubreddit - Reddit...'."""
+    t = re.sub(r"\s+", " ", title).strip()
+    t = re.sub(r"\s*-\s*Reddit[A-Za-z0-9 _-]+-\s*Reddit.*$", "", t)
+    t = re.sub(r"\s*-\s*Quora$", "", t, flags=re.I)
+    return t.strip()
+
+
+def extract_subreddit_or_tag(url: str, fallback: str = "Community") -> str:
+    m = re.search(r"reddit\.com/(r/[A-Za-z0-9_]+)", url, flags=re.I)
+    if m:
+        return m.group(1)
+    if "quora.com" in url.lower():
+        return "Quora Q&A"
+    return fallback
+
+
+def infer_quick_sentiment(text: str) -> str:
+    low = text.lower()
+    neg_words = [
+        "propaganda", "scam", "fake", "overpriced", "ripoff", "rip-off", "depreciat",
+        "worthless", "manipulat", "cartel", "monopoly", "greenwash", "skeptic", "mislead",
+        "lab grown is better", "waste of money", "bs", "nonsense", "hypocrisy",
+    ]
+    pos_words = [
+        "authentic", "heritage", "real value", "timeless", "sustainable", "ethical",
+        "investment", "craftsmanship", "interview", "campaign", "ambassador", "celebrat",
+    ]
+    neg_hits = sum(1 for w in neg_words if w in low)
+    pos_hits = sum(1 for w in pos_words if w in low)
+    if neg_hits > pos_hits:
+        return "Negative"
+    if pos_hits > neg_hits:
+        return "Positive"
+    return "Neutral"
 
 
 def estimate_domain_authority_1000(url: str) -> tuple[str, int]:
@@ -494,6 +569,7 @@ def search_via_serper(query: str, serper_key: str, gl: str = "in", num: int = 30
             "title": it.get("title", ""),
             "body": it.get("snippet", ""),
             "href": it.get("link", ""),
+            "date": it.get("date", ""),
         }
         for it in items
         if it.get("link")
@@ -514,8 +590,9 @@ def search_via_tavily(query: str, tavily_key: str, max_results: int = 20, includ
     return [
         {
             "title": it.get("title", ""),
-            "body": it.get("content", "")[:200],
+            "body": it.get("content", "")[:240],
             "href": it.get("url", ""),
+            "date": "",
         }
         for it in resp.json().get("results", [])
         if it.get("url")
@@ -533,9 +610,10 @@ def search_google_news_rss(query: str, gl: str = "IN", max_res: int = 30) -> lis
         for item in root.findall(".//item")[:max_res]:
             title = item.findtext("title") or ""
             link = item.findtext("link") or ""
+            pub_date = item.findtext("pubDate") or ""
             source_el = item.find("source")
             src_url = source_el.attrib.get("url", "") if source_el is not None else ""
-            out.append({"title": title, "body": title, "href": src_url or link})
+            out.append({"title": title, "body": title, "href": src_url or link, "date": pub_date[:16]})
         return out
     except Exception:
         return []
@@ -607,6 +685,7 @@ def collect_live_mentions_novastacks_scale(
         exclude_own_domain: bool = False,
         strict_relevance: bool = True,
         exact_brand_only: bool = False,
+        match_source: str = "Brand Mention",
     ):
         telemetry[channel_name]["raw"] += len(raw_list)
         target_bucket = evidence[channel_name]
@@ -618,14 +697,16 @@ def collect_live_mentions_novastacks_scale(
                 continue
             if required_domains and not host_matches_allowed(u, required_domains):
                 continue
-            title_txt = it.get("title", "").strip()
-            snip_txt = (it.get("body") or it.get("snippet") or "").strip()[:180]
+            title_txt = clean_serp_title(it.get("title", ""))
+            snip_txt = (it.get("body") or it.get("snippet") or "").strip()[:260]
             if not is_relevant(title_txt, snip_txt, u, strict=strict_relevance, exact_brand_only=exact_brand_only):
                 continue
             dom, da = estimate_domain_authority_1000(u)
             if exclude_own_domain and (dom == domain.lower() or dom.endswith("." + domain.lower())):
                 continue
             seen_urls.add(u)
+            tag_label = extract_subreddit_or_tag(u, fallback=match_source)
+            sent_label = infer_quick_sentiment(f"{title_txt} {snip_txt}")
             target_bucket.append(
                 {
                     "title": title_txt,
@@ -633,6 +714,9 @@ def collect_live_mentions_novastacks_scale(
                     "url": u,
                     "domain": dom,
                     "authority_1000": da,
+                    "tag": tag_label,
+                    "sentiment": sent_label,
+                    "date": it.get("date", ""),
                 }
             )
         telemetry[channel_name]["kept"] = len(target_bucket)
@@ -669,19 +753,16 @@ def collect_live_mentions_novastacks_scale(
         req_doms = domain_matchers.get(name)
         is_g2 = name == "G2"
 
-        # Pass 1: Direct quoted brand query (require exact brand/domain match on G2 to prevent software false positives)
         r1 = run_web_query(f'"{clean_brand}" {site_filter}', cap, include_domains=req_doms)
-        ingest(name, r1, cap, required_domains=req_doms, strict_relevance=is_g2, exact_brand_only=is_g2)
+        ingest(name, r1, cap, required_domains=req_doms, strict_relevance=is_g2, exact_brand_only=is_g2, match_source="Direct Brand")
 
-        # Pass 2: Domain-stem query for X/Facebook/Reddit/Quora if still below cap
         if not is_g2 and len(evidence[name]) < cap and len(domain_stem) >= 6:
             r1b = run_web_query(f"{domain_stem} {site_filter}", cap, include_domains=req_doms)
-            ingest(name, r1b, cap, required_domains=req_doms, strict_relevance=True)
+            ingest(name, r1b, cap, required_domains=req_doms, strict_relevance=True, match_source="Domain Mention")
 
-        # Pass 3: Category debate query on Reddit & Quora
         if name in ("Reddit", "Quora") and len(evidence[name]) < cap and clean_cat.lower() != clean_brand.lower():
             r2 = run_web_query(f"{clean_cat} {site_filter}", cap, include_domains=req_doms)
-            ingest(name, r2, cap, required_domains=req_doms, strict_relevance=True)
+            ingest(name, r2, cap, required_domains=req_doms, strict_relevance=True, match_source="Category Debate")
 
     # 2. News (50 target)
     if serper_key:
@@ -691,6 +772,7 @@ def collect_live_mentions_novastacks_scale(
                 search_via_serper(clean_brand, serper_key, gl=gl_low, num=35, search_type="news"),
                 50,
                 strict_relevance=False,
+                match_source="Brand Press",
             )
             if len(evidence["News"]) < 50 and clean_cat.lower() != clean_brand.lower():
                 ingest(
@@ -698,6 +780,7 @@ def collect_live_mentions_novastacks_scale(
                     search_via_serper(clean_cat, serper_key, gl=gl_low, num=25, search_type="news"),
                     50,
                     strict_relevance=True,
+                    match_source="Category Press",
                 )
         except Exception as e:
             diag["errors"].append(f"Serper News: {str(e)[:120]}")
@@ -712,12 +795,12 @@ def collect_live_mentions_novastacks_scale(
         if len(evidence["News"]) < 25:
             ingest("News", search_google_news_rss(clean_brand, gl=gl_up, max_res=30), 50, strict_relevance=False)
 
-    # 3. General Web (100 target — clean queries without chained -site: operators)
+    # 3. General Web (100 target)
     w1 = run_web_query(f'"{clean_brand}"', 60)
-    ingest("Web", w1, 100, exclude_own_domain=True, strict_relevance=False)
+    ingest("Web", w1, 100, exclude_own_domain=True, strict_relevance=False, match_source="Web Mention")
     if len(evidence["Web"]) < 100 and clean_cat.lower() != clean_brand.lower():
         w2 = run_web_query(clean_cat, 60)
-        ingest("Web", w2, 100, exclude_own_domain=True, strict_relevance=True)
+        ingest("Web", w2, 100, exclude_own_domain=True, strict_relevance=True, match_source="Category Web")
 
     if len(evidence["Web"]) == 0 and not serper_key and not tavily_key:
         rss_web = search_google_news_rss(f"{clean_brand} OR {clean_cat}", gl=gl_up, max_res=30)
@@ -754,17 +837,18 @@ def run_brand_intelligence_pipeline(
         web_and_news,
         key=lambda x: x["authority_1000"],
         reverse=True,
-    )[:6]
+    )[:8]
 
     digest_for_llm = {
         ch: [
             {
                 "title": it["title"][:110],
-                "snippet": it["snippet"][:140],
+                "snippet": it["snippet"][:160],
+                "url": it["url"],
                 "domain": it["domain"],
                 "da": it["authority_1000"],
             }
-            for it in items[:7]
+            for it in items[:8]
         ]
         for ch, items in evidence.items()
         if items
@@ -781,7 +865,8 @@ Live Harvested Evidence Sample:
 {json.dumps(digest_for_llm)}
 
 IMPORTANT RULES:
-- Every headline in "news_cards" and "top_authority_sentiments" MUST come strictly from the Live Harvested Evidence Sample above.
+- Every headline and URL in "news_cards", "top_authority_sentiments", and "thread_triage" MUST come strictly from the Live Harvested Evidence Sample above.
+- Provide 4 to 6 high-priority threads in "thread_triage.priority_threads" with exact URLs, the buyer objection/risk context, and a ready-to-post non-defensive reply draft.
 - If User Competitor Overrides is empty, identify 2-3 real direct competitors in {market} for {brand}'s industry.
 
 Return strict JSON:
@@ -822,17 +907,12 @@ Return strict JSON:
     "positive_pct": integer,
     "negative_pct": integer,
     "neutral_pct": integer,
-    "narrative": "2-3 sentence analytical callout explaining what drives negative vs positive share.",
-    "quora_threads": [
-      {{"title": "real Quora question from evidence", "tag": "Mentions Brand or Category"}}
-    ],
-    "reddit_threads": [
-      {{"title": "real Reddit thread from evidence", "tag": "r/subreddit"}}
-    ]
+    "narrative": "2-3 sentence analytical callout explaining what drives negative vs positive share."
   }},
   "news_cards": [
     {{
       "headline": "real news/press headline from evidence",
+      "url": "exact url from evidence",
       "domain": "outlet.com",
       "tone": "Positive | Negative | Neutral",
       "summary": "1-2 sentence summary of the coverage."
@@ -842,6 +922,7 @@ Return strict JSON:
     {{
       "domain": "domain",
       "headline": "headline",
+      "url": "exact url from evidence",
       "authority": integer,
       "sentiment": "Positive | Negative | Neutral"
     }}
@@ -849,7 +930,7 @@ Return strict JSON:
   "top_pain_points": [
     {{
       "title": "Pain point title",
-      "channels": "e.g. Quora, Web",
+      "channels": "e.g. Quora, Reddit, Web",
       "detail": "1-2 sentence explanation."
     }}
   ],
@@ -859,8 +940,11 @@ Return strict JSON:
       {{
         "source": "Reddit r/... or Quora",
         "title": "real thread title from evidence",
+        "url": "exact url from evidence",
         "priority": "High priority | Medium priority",
-        "recommendation": "Concrete, non-defensive reply strategy."
+        "risk_context": "1 sentence explaining why this thread matters for buyer perception & AI citations.",
+        "recommendation": "Concrete, non-defensive reply strategy.",
+        "draft_reply": "A concise, credible 2-3 sentence response draft ready to post."
       }}
     ]
   }},
@@ -941,14 +1025,51 @@ Return strict JSON:
             {
                 "domain": x["domain"],
                 "headline": x["title"],
+                "url": x["url"],
                 "authority": x["authority_1000"],
-                "sentiment": "Neutral",
+                "sentiment": x.get("sentiment", "Neutral"),
             }
-            for x in combined_authority_pool[:6]
+            for x in combined_authority_pool[:8]
         ],
         "ai": ai_out,
         "evidence": evidence,
     }
+
+
+def render_rich_thread_card(item: dict, platform: str):
+    title_esc = html.escape(item.get("title", "Untitled Thread"))
+    snip_raw = item.get("snippet", "").strip()
+    snip_esc = html.escape(snip_raw) if snip_raw else "No preview snippet indexed for this URL."
+    url_esc = html.escape(item.get("url", "#"), quote=True)
+    tag_esc = html.escape(item.get("tag", platform))
+    sent_val = item.get("sentiment", "Neutral")
+
+    s_bg, s_fg = (
+        ("rgba(16,185,129,0.16)", "#34d399")
+        if sent_val == "Positive"
+        else ("rgba(239,68,68,0.16)", "#f87171")
+        if sent_val == "Negative"
+        else ("rgba(148,163,184,0.16)", "#94a3b8")
+    )
+    t_bg, t_fg = (
+        ("rgba(249,115,22,0.16)", "#fb923c")
+        if platform == "Reddit"
+        else ("rgba(34,211,238,0.14)", "#22d3ee")
+    )
+
+    st.markdown(
+        f'<div class="thread-card">'
+        f'<a class="thread-title-link" href="{url_esc}" target="_blank" rel="noopener noreferrer">{title_esc} ↗</a>'
+        f'<div class="thread-snippet">{snip_esc}</div>'
+        f'<div class="thread-footer">'
+        f'<div>'
+        f'<span class="badge" style="background:{t_bg};color:{t_fg};margin-right:6px;">{tag_esc}</span>'
+        f'<span class="badge" style="background:{s_bg};color:{s_fg};">{sent_val}</span>'
+        f'</div>'
+        f'<a href="{url_esc}" target="_blank" rel="noopener noreferrer" style="font-family:monospace;font-size:0.75rem;color:#38bdf8;text-decoration:none;">Open source →</a>'
+        f'</div></div>',
+        unsafe_allow_html=True,
+    )
 
 
 # --- SIDEBAR NAVIGATION & INPUTS ---
@@ -1059,6 +1180,7 @@ crawl = st.session_state["bi_crawl"]
 entity = report["entity"]
 ai = report["ai"]
 channels = report["channels"]
+evidence = report.get("evidence", {})
 total_mentions = report["total_mentions"]
 active_platforms = report["active_platforms"]
 sent = ai.get("sentiment", {})
@@ -1069,7 +1191,7 @@ search_diag = report.get("search_diag", {})
 if search_diag.get("errors") and total_mentions == 0:
     st.warning(
         f"**Search Engine Notice ({search_diag.get('engine')}):** `{search_diag['errors'][0]}` — "
-        "Add a free **Serper.dev API key** (2,500 free Google searches) in the sidebar to populate all 9 platforms."
+        "Add a free **Serper.dev API key** in the sidebar to populate all 9 platforms."
     )
 
 pill_colors = {
@@ -1237,25 +1359,73 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-quora_cnt = next((c["mentions"] for c in channels if c["platform"] == "Quora"), 0)
-reddit_cnt = next((c["mentions"] for c in channels if c["platform"] == "Reddit"), 0)
+quora_items = evidence.get("Quora", [])
+reddit_items = evidence.get("Reddit", [])
+quora_cnt = len(quora_items)
+reddit_cnt = len(reddit_items)
+
 tq, tr = st.columns(2)
 with tq:
     st.markdown(f"#### On Quora ({quora_cnt} questions)")
-    for item in sent.get("quora_threads", [])[:5]:
-        st.markdown(
-            f'<div class="thread-card"><div style="font-weight:600;color:#e2e8f0;margin-bottom:6px;">"{item.get("title", "")}"</div>'
-            f'<span class="badge" style="background:rgba(34,211,238,0.14);color:#22d3ee;">{item.get("tag", "Quora")}</span></div>',
-            unsafe_allow_html=True,
-        )
+    if not quora_items:
+        st.caption("No Quora threads captured in this run.")
+    for item in quora_items[:6]:
+        render_rich_thread_card(item, "Quora")
+
 with tr:
     st.markdown(f"#### On Reddit ({reddit_cnt} threads)")
-    for item in sent.get("reddit_threads", [])[:5]:
-        st.markdown(
-            f'<div class="thread-card"><div style="font-weight:600;color:#e2e8f0;margin-bottom:6px;">"{item.get("title", "")}"</div>'
-            f'<span class="badge" style="background:rgba(249,115,22,0.14);color:#fb923c;">{item.get("tag", "Reddit")}</span></div>',
-            unsafe_allow_html=True,
+    if not reddit_items:
+        st.caption("No Reddit threads captured in this run.")
+    for item in reddit_items[:6]:
+        render_rich_thread_card(item, "Reddit")
+
+with st.expander(f"📂 Browse All {total_mentions} Harvested Threads & Mentions (Full Detailed Table)", expanded=False):
+    tab_names = ["Reddit", "Quora", "News", "Web", "Social (X / YT / FB / IG)"]
+    tabs = st.tabs(tab_names)
+
+    def render_evidence_table(items_list: list[dict]):
+        if not items_list:
+            st.caption("No mentions harvested for this channel.")
+            return
+        df = pd.DataFrame(
+            [
+                {
+                    "Title": it.get("title", ""),
+                    "Snippet / Context": it.get("snippet", ""),
+                    "Tag": it.get("tag", ""),
+                    "Sentiment": it.get("sentiment", "Neutral"),
+                    "DA": it.get("authority_1000", 0),
+                    "URL": it.get("url", ""),
+                }
+                for it in items_list
+            ]
         )
+        st.dataframe(
+            df,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "URL": st.column_config.LinkColumn("Source Link", display_text="Open ↗"),
+                "DA": st.column_config.NumberColumn("DA (0-1000)", format="%d"),
+            },
+        )
+
+    with tabs[0]:
+        render_evidence_table(evidence.get("Reddit", []))
+    with tabs[1]:
+        render_evidence_table(evidence.get("Quora", []))
+    with tabs[2]:
+        render_evidence_table(evidence.get("News", []))
+    with tabs[3]:
+        render_evidence_table(evidence.get("Web", []))
+    with tabs[4]:
+        social_combined = (
+            evidence.get("X", [])
+            + evidence.get("YouTube", [])
+            + evidence.get("Facebook", [])
+            + evidence.get("Instagram", [])
+        )
+        render_evidence_table(social_combined)
 
 st.markdown('<hr class="report-divider">', unsafe_allow_html=True)
 
@@ -1273,19 +1443,27 @@ for idx, nc in enumerate(ai.get("news_cards", [])[:6], start=1):
         if tone == "Negative"
         else ("rgba(148,163,184,0.16)", "#cbd5e1")
     )
+    n_url = html.escape(nc.get("url", ""), quote=True)
+    headline_html = (
+        f'<a href="{n_url}" target="_blank" rel="noopener noreferrer" style="font-weight:700;color:#f8fafc;text-decoration:none;">{idx}. {html.escape(nc.get("headline", ""))} ↗</a>'
+        if n_url
+        else f'<span style="font-weight:700;color:#f8fafc;">{idx}. {html.escape(nc.get("headline", ""))}</span>'
+    )
     st.markdown(
         f'<div class="thread-card">'
-        f'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">'
-        f'<span style="font-weight:700;color:#f8fafc;">{idx}. {nc.get("headline")}</span>'
+        f'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;gap:10px;">'
+        f'{headline_html}'
         f'<span class="badge" style="background:{t_bg};color:{t_fg};">{tone}</span></div>'
-        f'<div style="font-family:monospace;font-size:0.78rem;color:#22d3ee;margin-bottom:4px;">{nc.get("domain")}</div>'
-        f'<div style="color:#94a3b8;font-size:0.88rem;">{nc.get("summary")}</div></div>',
+        f'<div style="font-family:monospace;font-size:0.78rem;color:#22d3ee;margin-bottom:4px;">{html.escape(nc.get("domain", ""))}</div>'
+        f'<div style="color:#94a3b8;font-size:0.88rem;">{html.escape(nc.get("summary", ""))}</div></div>',
         unsafe_allow_html=True,
     )
 
 st.markdown("#### Top Web Mentions by Domain Authority (0–1000)")
 if report.get("authority_table"):
-    st.dataframe(pd.DataFrame(report["authority_table"]), use_container_width=True, hide_index=True)
+    auth_df = pd.DataFrame(report["authority_table"])
+    col_cfg = {"url": st.column_config.LinkColumn("Source Link", display_text="Open ↗")} if "url" in auth_df.columns else {}
+    st.dataframe(auth_df, use_container_width=True, hide_index=True, column_config=col_cfg)
 
 st.markdown('<hr class="report-divider">', unsafe_allow_html=True)
 
@@ -1316,9 +1494,9 @@ st.markdown("## Core Buyer Objections & Narrative Friction")
 for idx, pp in enumerate(ai.get("top_pain_points", [])[:5], start=1):
     st.markdown(
         f'<div class="thread-card">'
-        f'<div style="font-weight:700;color:#f8fafc;">{idx}. {pp.get("title")} '
-        f'<span style="font-family:monospace;font-size:0.78rem;color:#eab308;">({pp.get("channels")})</span></div>'
-        f'<div style="color:#94a3b8;font-size:0.88rem;margin-top:4px;">{pp.get("detail")}</div></div>',
+        f'<div style="font-weight:700;color:#f8fafc;">{idx}. {html.escape(pp.get("title", ""))} '
+        f'<span style="font-family:monospace;font-size:0.78rem;color:#eab308;">({html.escape(pp.get("channels", ""))})</span></div>'
+        f'<div style="color:#94a3b8;font-size:0.88rem;margin-top:4px;">{html.escape(pp.get("detail", ""))}</div></div>',
         unsafe_allow_html=True,
     )
 
@@ -1341,13 +1519,32 @@ with tk3:
 for pt in triage.get("priority_threads", []):
     prio = pt.get("priority", "High priority")
     p_bg, p_fg = ("rgba(239,68,68,0.16)", "#f87171") if "High" in prio else ("rgba(234,179,8,0.16)", "#facc15")
+    t_url = html.escape(pt.get("url", ""), quote=True)
+    t_title = html.escape(pt.get("title", ""))
+    title_block = (
+        f'<a href="{t_url}" target="_blank" rel="noopener noreferrer" style="font-weight:700;color:#f8fafc;text-decoration:none;display:block;margin:6px 0;">{t_title} ↗</a>'
+        if t_url
+        else f'<div style="font-weight:700;color:#f8fafc;margin:6px 0;">{t_title}</div>'
+    )
+    risk_html = (
+        f'<div style="color:#cbd5e1;font-size:0.86rem;margin-bottom:6px;"><strong>Why it matters:</strong> {html.escape(pt.get("risk_context", ""))}</div>'
+        if pt.get("risk_context")
+        else ""
+    )
+    draft_html = (
+        f'<div class="draft-reply-box"><span style="font-family:monospace;font-size:0.72rem;color:#22d3ee;display:block;margin-bottom:4px;">SUGGESTED REPLY DRAFT</span>{html.escape(pt.get("draft_reply", ""))}</div>'
+        if pt.get("draft_reply")
+        else ""
+    )
     st.markdown(
         f'<div class="thread-card">'
         f'<div style="display:flex;justify-content:space-between;align-items:center;">'
-        f'<span style="font-family:monospace;font-size:0.78rem;color:#22d3ee;">{pt.get("source")}</span>'
-        f'<span class="badge" style="background:{p_bg};color:{p_fg};">{prio}</span></div>'
-        f'<div style="font-weight:700;color:#f8fafc;margin:6px 0;">{pt.get("title")}</div>'
-        f'<div style="color:#94a3b8;font-size:0.88rem;"><strong>Recommended:</strong> {pt.get("recommendation")}</div></div>',
+        f'<span style="font-family:monospace;font-size:0.78rem;color:#22d3ee;">{html.escape(pt.get("source", ""))}</span>'
+        f'<span class="badge" style="background:{p_bg};color:{p_fg};">{html.escape(prio)}</span></div>'
+        f'{title_block}'
+        f'{risk_html}'
+        f'<div style="color:#94a3b8;font-size:0.86rem;"><strong>Strategy:</strong> {html.escape(pt.get("recommendation", ""))}</div>'
+        f'{draft_html}</div>',
         unsafe_allow_html=True,
     )
 
