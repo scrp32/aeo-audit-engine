@@ -1,19 +1,160 @@
+import datetime
 import json
 import re
 import time
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlparse
 
 import pandas as pd
 import requests
 import streamlit as st
 from bs4 import BeautifulSoup
+from ddgs import DDGS
 from google import genai
 from google.genai import types
 
 st.set_page_config(
-    page_title="AEO Visibility & Readiness Auditor",
-    page_icon="🔍",
+    page_title="Brand Intelligence & AEO Report",
+    page_icon="🧬",
     layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# --- NOVASTACKS DARK EXECUTIVE THEME CSS ---
+st.markdown(
+    """
+<style>
+    /* Main dark canvas with subtle technical grid */
+    .stApp {
+        background-color: #0b0f14;
+        background-image:
+            linear-gradient(to right, rgba(255, 255, 255, 0.025) 1px, transparent 1px),
+            linear-gradient(to bottom, rgba(255, 255, 255, 0.025) 1px, transparent 1px);
+        background-size: 36px 36px;
+        color: #e6edf3;
+    }
+    section[data-testid="stSidebar"] {
+        background-color: #090c10;
+        border-right: 1px solid #1e2631;
+    }
+    .section-kicker {
+        font-family: monospace;
+        font-size: 0.78rem;
+        letter-spacing: 0.14em;
+        color: #22d3ee;
+        text-transform: uppercase;
+        margin-bottom: 0.25rem;
+    }
+    .hero-brand {
+        font-size: 3.1rem;
+        font-weight: 800;
+        color: #22d3ee;
+        line-height: 1.1;
+        margin: 0;
+        text-align: center;
+    }
+    .hero-sub {
+        font-size: 2.9rem;
+        font-weight: 800;
+        color: #f8fafc;
+        line-height: 1.15;
+        margin: 0 0 0.75rem 0;
+        text-align: center;
+    }
+    .hero-meta {
+        font-family: monospace;
+        color: #94a3b8;
+        font-size: 0.9rem;
+        text-align: center;
+        margin-bottom: 1.8rem;
+    }
+    .kpi-box {
+        text-align: center;
+        padding: 0.5rem 1rem;
+    }
+    .kpi-val {
+        font-size: 2.1rem;
+        font-weight: 800;
+        color: #f8fafc;
+    }
+    .kpi-val-red {
+        font-size: 2.1rem;
+        font-weight: 800;
+        color: #f87171;
+    }
+    .kpi-lbl {
+        font-family: monospace;
+        font-size: 0.78rem;
+        color: #64748b;
+        margin-top: 0.15rem;
+    }
+    .pill-row {
+        display: flex;
+        flex-wrap: wrap;
+        justify-content: center;
+        gap: 8px;
+        margin-top: 1.2rem;
+    }
+    .plat-pill {
+        font-family: monospace;
+        font-size: 0.76rem;
+        padding: 4px 12px;
+        border-radius: 6px;
+        border: 1px solid rgba(255,255,255,0.12);
+    }
+    .subscore-card {
+        background: #11161f;
+        border: 1px solid #1e293b;
+        border-radius: 10px;
+        padding: 14px 18px;
+        margin-bottom: 12px;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+    }
+    .sent-card-pos {
+        background: rgba(16, 185, 129, 0.08);
+        border: 1px solid rgba(16, 185, 129, 0.25);
+        border-radius: 10px;
+        padding: 20px;
+        text-align: center;
+    }
+    .sent-card-neg {
+        background: rgba(239, 68, 68, 0.08);
+        border: 1px solid rgba(239, 68, 68, 0.25);
+        border-radius: 10px;
+        padding: 20px;
+        text-align: center;
+    }
+    .sent-card-neu {
+        background: rgba(148, 163, 184, 0.08);
+        border: 1px solid rgba(148, 163, 184, 0.25);
+        border-radius: 10px;
+        padding: 20px;
+        text-align: center;
+    }
+    .thread-card {
+        background: #11161f;
+        border: 1px solid #1e293b;
+        border-radius: 10px;
+        padding: 16px;
+        margin-bottom: 10px;
+    }
+    .badge {
+        display: inline-block;
+        padding: 3px 10px;
+        border-radius: 6px;
+        font-family: monospace;
+        font-size: 0.78rem;
+        font-weight: 600;
+    }
+    .report-divider {
+        border: 0;
+        border-top: 1px solid #1e293b;
+        margin: 2.5rem 0;
+    }
+</style>
+""",
+    unsafe_allow_html=True,
 )
 
 HEADERS = {
@@ -23,26 +164,23 @@ HEADERS = {
     )
 }
 
-AI_BOTS = ["GPTBot", "OAI-SearchBot", "Google-Extended", "PerplexityBot", "ClaudeBot"]
-
-RECOMMENDED_SCHEMAS = {
-    "Organization",
-    "LocalBusiness",
-    "FAQPage",
-    "Article",
-    "Product",
-    "Service",
-    "WebSite",
-    "BreadcrumbList",
-    "HowTo",
-}
-
-# Models available on the Gemini API Free Tier (with separate per-model quotas)
 MODEL_CANDIDATES = [
     "gemini-4-hydrogen",
     "gemini-3.8-flash",
     "gemini-3.6-flash",
     "gemini-3.5-flash-lite",
+]
+
+CHANNELS = [
+    ("Reddit", "site:reddit.com", "#f97316"),
+    ("Quora", "site:quora.com", "#eab308"),
+    ("G2", "site:g2.com", "#ef4444"),
+    ("Web", "", "#38bdf8"),
+    ("News", "", "#10b981"),
+    ("X", "site:x.com OR site:twitter.com", "#64748b"),
+    ("YouTube", "site:youtube.com", "#f43f5e"),
+    ("Facebook", "site:facebook.com", "#3b82f6"),
+    ("Instagram", "site:instagram.com", "#a855f7"),
 ]
 
 
@@ -61,16 +199,34 @@ def safe_json_loads(raw_text: str) -> dict:
     return json.loads(cleaned)
 
 
+def render_donut_svg(score: int, subtitle: str = "Brand Health Score", size: int = 190) -> str:
+    radius = 74
+    circumference = 2 * 3.14159265 * radius
+    pct = max(0, min(100, score)) / 100.0
+    offset = circumference * (1 - pct)
+    ring_color = "#22d3ee" if score >= 55 else "#f59e0b" if score >= 35 else "#ef4444"
+    return f"""
+    <div style="display:flex;justify-content:center;align-items:center;margin:1rem 0;">
+      <svg width="{size}" height="{size}" viewBox="0 0 180 180">
+        <circle cx="90" cy="90" r="{radius}" fill="none" stroke="#1e293b" stroke-width="13" />
+        <circle cx="90" cy="90" r="{radius}" fill="none" stroke="{ring_color}" stroke-width="13"
+                stroke-dasharray="{circumference:.1f}" stroke-dashoffset="{offset:.1f}"
+                stroke-linecap="round" transform="rotate(-90 90 90)" />
+        <text x="90" y="88" text-anchor="middle" fill="#f8fafc" font-size="34" font-weight="800" font-family="sans-serif">{score}</text>
+        <text x="90" y="110" text-anchor="middle" fill="#94a3b8" font-size="11" font-family="monospace">{subtitle}</text>
+      </svg>
+    </div>
+    """
+
+
 def generate_with_resilience(
     client: genai.Client,
     primary_model: str,
     contents: str,
     config: types.GenerateContentConfig,
 ):
-    """Tries primary model, waits briefly on 503, and switches model immediately on 404/429."""
     ordered_models = [primary_model] + [m for m in MODEL_CANDIDATES if m != primary_model]
     last_err = None
-
     for model_id in ordered_models:
         for attempt in range(2):
             try:
@@ -82,150 +238,41 @@ def generate_with_resilience(
             except Exception as err:
                 last_err = err
                 err_str = str(err).upper()
-                # Immediately switch to next model if quota (429) or not found (404)
                 if any(k in err_str for k in ["404", "NOT_FOUND", "429", "RESOURCE_EXHAUSTED"]):
                     break
-                # Brief backoff only for transient 503 overload
                 if "503" in err_str or "UNAVAILABLE" in err_str:
                     time.sleep(2 * (attempt + 1))
                     continue
                 raise err
-
-    raise RuntimeError(
-        f"Gemini API quota/availability error across fallback models ({', '.join(ordered_models)}). "
-        f"If 'Live Google Search Grounding' is checked, uncheck it in the sidebar (requires a paid Tier 1 key) "
-        f"or wait 60 seconds for per-minute quota reset. Details: {last_err}"
-    )
+    raise RuntimeError(f"All fallback models hit rate/availability limits. Last error: {last_err}")
 
 
-def check_robots_and_llms(base_url: str) -> dict:
-    parsed = urlparse(base_url)
-    root = f"{parsed.scheme}://{parsed.netloc}"
-    bot_status = {bot: "Allowed (Default)" for bot in AI_BOTS}
-    robots_found = False
-    llms_txt_found = False
-
-    try:
-        r = requests.get(urljoin(root, "/robots.txt"), headers=HEADERS, timeout=8)
-        if r.status_code == 200 and "user-agent" in r.text.lower():
-            robots_found = True
-            current_agents = []
-            for line in r.text.splitlines():
-                line = line.split("#")[0].strip()
-                if not line:
-                    continue
-                if line.lower().startswith("user-agent:"):
-                    agent = line.split(":", 1)[1].strip()
-                    current_agents = [agent]
-                elif line.lower().startswith("disallow:"):
-                    path = line.split(":", 1)[1].strip()
-                    if path == "/":
-                        for bot in AI_BOTS:
-                            if "*" in current_agents or any(
-                                bot.lower() == a.lower() for a in current_agents
-                            ):
-                                bot_status[bot] = "Blocked (Disallow: /)"
-    except Exception:
-        pass
-
-    try:
-        l_res = requests.get(urljoin(root, "/llms.txt"), headers=HEADERS, timeout=6)
-        if l_res.status_code == 200 and len(l_res.text.strip()) > 40 and "<html" not in l_res.text.lower():
-            llms_txt_found = True
-    except Exception:
-        pass
-
-    return {
-        "robots_found": robots_found,
-        "llms_txt_found": llms_txt_found,
-        "bot_status": bot_status,
-    }
-
-
-def extract_json_ld_types(soup: BeautifulSoup) -> list[str]:
-    found_types = []
-    for script in soup.find_all("script", type="application/ld+json"):
-        if not script.string:
-            continue
-        try:
-            data = json.loads(script.string)
-            items = data if isinstance(data, list) else [data]
-            for item in items:
-                if isinstance(item, dict):
-                    if "@graph" in item and isinstance(item["@graph"], list):
-                        for node in item["@graph"]:
-                            t = node.get("@type")
-                            if isinstance(t, list):
-                                found_types.extend(t)
-                            elif isinstance(t, str):
-                                found_types.append(t)
-                    t = item.get("@type")
-                    if isinstance(t, list):
-                        found_types.extend(t)
-                    elif isinstance(t, str):
-                        found_types.append(t)
-        except Exception:
-            continue
-    return sorted(set(found_types))
-
-
-def crawl_site(url: str) -> dict:
+def crawl_homepage(url: str) -> dict:
     resp = requests.get(url, headers=HEADERS, timeout=15)
     resp.raise_for_status()
     soup = BeautifulSoup(resp.text, "lxml")
 
     title = soup.title.string.strip() if soup.title and soup.title.string else ""
-    meta_desc_tag = soup.find("meta", attrs={"name": re.compile("^description$", re.I)})
-    meta_desc = meta_desc_tag.get("content", "").strip() if meta_desc_tag else ""
-
+    meta_tag = soup.find("meta", attrs={"name": re.compile("^description$", re.I)})
+    meta_desc = meta_tag.get("content", "").strip() if meta_tag else ""
     h1s = [h.get_text(" ", strip=True) for h in soup.find_all("h1")]
     h2s = [h.get_text(" ", strip=True) for h in soup.find_all("h2")]
-    h3s = [h.get_text(" ", strip=True) for h in soup.find_all("h3")]
 
-    all_headings = h1s + h2s + h3s
-    question_headings = [
-        h
-        for h in all_headings
-        if "?" in h
-        or h.lower().startswith(("what ", "how ", "why ", "when ", "where ", "which ", "can ", "is "))
-    ]
-
-    schemas = extract_json_ld_types(soup)
-    bots_and_llms = check_robots_and_llms(resp.url)
+    schemas = []
+    for s in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(s.string or "{}")
+            items = data if isinstance(data, list) else [data]
+            for it in items:
+                if isinstance(it, dict) and "@type" in it:
+                    t = it["@type"]
+                    schemas.extend(t if isinstance(t, list) else [t])
+        except Exception:
+            pass
 
     for tag in soup(["script", "style", "noscript", "svg"]):
         tag.decompose()
-    body_text = re.sub(r"\s+", " ", soup.get_text(" ", strip=True))
-    word_count = len(body_text.split())
-
-    has_semantic_tags = bool(soup.find(["main", "article", "section"]))
-    has_tables_or_lists = len(soup.find_all(["ul", "ol", "table"])) >= 2
-
-    score = 0
-    breakdown = {}
-
-    allowed_count = sum(1 for v in bots_and_llms["bot_status"].values() if "Allowed" in v)
-    crawler_pts = int((allowed_count / len(AI_BOTS)) * 20) + (5 if bots_and_llms["llms_txt_found"] else 0)
-    score += crawler_pts
-    breakdown["AI Crawler & llms.txt Access"] = f"{crawler_pts}/25"
-
-    schema_pts = min(25, len(schemas) * 8 + (5 if "FAQPage" in schemas else 0))
-    score += schema_pts
-    breakdown["Schema & Entity Markup"] = f"{schema_pts}/25"
-
-    qa_pts = min(15, len(question_headings) * 5)
-    struct_pts = (8 if has_semantic_tags else 0) + (7 if has_tables_or_lists else 0)
-    score += qa_pts + struct_pts
-    breakdown["Q&A Coverage & Extractable Formatting"] = f"{qa_pts + struct_pts}/30"
-
-    entity_pts = (
-        (5 if title else 0)
-        + (5 if len(meta_desc) >= 60 else 0)
-        + (5 if len(h1s) == 1 else 2 if len(h1s) > 1 else 0)
-        + (5 if word_count >= 350 else 2)
-    )
-    score += entity_pts
-    breakdown["Entity Clarity & Content Depth"] = f"{entity_pts}/20"
+    text = re.sub(r"\s+", " ", soup.get_text(" ", strip=True))
 
     return {
         "final_url": resp.url,
@@ -233,317 +280,526 @@ def crawl_site(url: str) -> dict:
         "title": title,
         "meta_description": meta_desc,
         "h1s": h1s[:5],
-        "h2s": h2s[:12],
-        "question_headings": question_headings[:10],
-        "word_count": word_count,
-        "schemas_found": schemas,
-        "schemas_missing": sorted(RECOMMENDED_SCHEMAS - set(schemas)),
-        "bots_and_llms": bots_and_llms,
-        "readiness_score": score,
-        "score_breakdown": breakdown,
-        "body_excerpt": body_text[:4000],
+        "h2s": h2s[:10],
+        "schemas": sorted(set(schemas)),
+        "excerpt": text[:3500],
     }
 
 
-def run_llm_and_serp_audit(
+def collect_live_mentions(brand: str, domain: str, category: str, market: str) -> dict:
+    """Queries live DuckDuckGo web & news indices across all 9 channels at $0 cost."""
+    region_map = {
+        "India": "in-en",
+        "United States": "us-en",
+        "United Kingdom": "uk-en",
+        "Singapore": "sg-en",
+        "Australia": "au-en",
+        "Global": "wt-wt",
+    }
+    region = region_map.get(market, "wt-wt")
+    evidence = {ch[0]: [] for ch in CHANNELS}
+
+    with DDGS() as ddgs:
+        # Web general mentions
+        try:
+            web_hits = list(ddgs.text(f'"{brand}" OR "{domain}"', region=region, max_results=12))
+            evidence["Web"] = web_hits
+        except Exception:
+            pass
+
+        # News mentions
+        try:
+            news_hits = list(ddgs.news(f'"{brand}"', region=region, max_results=8))
+            evidence["News"] = news_hits
+        except Exception:
+            pass
+
+        # Social & Review Platforms
+        for name, site_filter, _ in CHANNELS:
+            if name in ("Web", "News"):
+                continue
+            try:
+                q = f'"{brand}" {site_filter}'
+                hits = list(ddgs.text(q, region=region, max_results=6))
+                evidence[name] = hits
+            except Exception:
+                evidence[name] = []
+
+    return evidence
+
+
+def run_brand_intelligence_pipeline(
     client: genai.Client,
     model_name: str,
-    use_search_grounding: bool,
     crawl_data: dict,
     market: str,
     competitors_override: list[str],
-    concern: str,
 ) -> dict:
-    # Call 1: Entity, Competitors & Test Plan (No search tool needed -> fast & quota-light)
-    discovery_prompt = f"""
-Analyze this crawled webpage and generate an AEO test plan for target market: {market}.
+    # Call 1: Identify exact brand entity, category & competitors
+    entity_prompt = f"""
+Identify the brand entity, industry category, and 3 direct competitors in {market} from this homepage:
 Domain: {crawl_data['domain']}
 Title: {crawl_data['title']}
-Meta Description: {crawl_data['meta_description']}
+Meta: {crawl_data['meta_description']}
 H1s: {crawl_data['h1s']}
-H2s: {crawl_data['h2s']}
-User's specific AEO concern: {concern or 'General AI recommendation visibility'}
-User-supplied competitors (use these if non-empty, otherwise infer 2 top direct competitors in {market}): {competitors_override}
-Page Text Excerpt:
-{crawl_data['body_excerpt']}
+User competitor overrides (use if provided): {competitors_override}
+Excerpt: {crawl_data['excerpt'][:2000]}
 
-Return strict JSON with keys:
-- "brand_name": string
-- "category": string (concise category description)
-- "competitors": list of 2 direct competitor brand names in {market}
-- "buyer_prompts": list of 5 realistic unbranded buyer-intent prompts a prospect in {market} would ask ChatGPT/Gemini when looking for this solution (do NOT include the brand name)
-- "core_keywords": list of 4 core commercial/informational Google search keywords for this business in {market}
+Return strict JSON:
+{{
+  "brand_name": "official brand name",
+  "category": "concise category",
+  "is_b2b_software": true or false,
+  "competitors": ["Competitor 1", "Competitor 2", "Competitor 3"]
+}}
 """
-    plan_resp = generate_with_resilience(
+    ent_resp = generate_with_resilience(
         client=client,
         primary_model=model_name,
-        contents=discovery_prompt,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            temperature=0.2,
-        ),
+        contents=entity_prompt,
+        config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.1),
     )
-    plan = safe_json_loads(plan_resp.text)
+    entity = safe_json_loads(ent_resp.text)
+    brand = entity["brand_name"]
 
-    brand = plan["brand_name"]
-    domain = crawl_data["domain"]
-    competitors = plan["competitors"][:2]
-    buyer_prompts = plan["buyer_prompts"][:5]
+    # Step 2: Live multi-channel search harvest
+    raw_evidence = collect_live_mentions(brand, crawl_data["domain"], entity["category"], market)
 
-    # Call 2: Single Consolidated Visibility + Competitive + SERP + Opportunities Assessment
-    # (Uses 1 API call instead of 6 so it never trips Free Tier RPM limits)
-    tools_list = [types.Tool(google_search=types.GoogleSearch())] if use_search_grounding else None
+    # Compact digest of live snippets for Gemini synthesis
+    compact_evidence = {}
+    for ch, items in raw_evidence.items():
+        compact_evidence[ch] = [
+            {
+                "title": it.get("title", ""),
+                "snippet": (it.get("body") or it.get("snippet") or "")[:220],
+                "url": it.get("href") or it.get("url") or "",
+            }
+            for it in items[:6]
+        ]
 
-    audit_prompt = f"""
-You are a senior Answer Engine Optimization (AEO) & Generative Engine Optimization (GEO) auditor.
-Evaluate {brand} ({domain}) vs competitors {competitors} in target market: {market}.
+    # Call 2: Full 11-Section Brand Intelligence & AEO Synthesis
+    synthesis_prompt = f"""
+You are a senior Brand Intelligence & Answer Engine Optimization (AEO) analyst generating an executive report in the style of Novastacks AI.
+Brand: {brand} ({crawl_data['domain']})
+Category: {entity['category']} | Target Market: {market}
+Competitors: {entity['competitors']}
+Detected On-Site Schemas: {crawl_data['schemas']}
 
-Crawled Technical Data:
-- AEO Readiness Score: {crawl_data['readiness_score']}/100 ({crawl_data['score_breakdown']})
-- Found JSON-LD Schemas: {crawl_data['schemas_found']}
-- Missing JSON-LD Schemas: {crawl_data['schemas_missing']}
-- AI Crawler & llms.txt Status: {crawl_data['bots_and_llms']}
-- Question Headings Found: {crawl_data['question_headings']}
+Live Harvested Web, News & Social Mentions across 9 channels:
+{json.dumps(compact_evidence, indent=2)}
 
-Unbranded Buyer Prompts to Evaluate for {market}:
-{json.dumps(buyer_prompts, indent=2)}
-
-Core Google Search Keywords to Evaluate for {market}:
-{json.dumps(plan['core_keywords'], indent=2)}
+Generate a rigorous, realistic Brand Intelligence & AI Visibility Report grounded in the harvested snippets above.
+Note: Scale estimated channel mention counts realistically based on the live search density found (e.g., if 6/6 Reddit hits returned rich threads, estimate realistic indexed thread volume; if G2 is irrelevant for a consumer/local brand, mark G2 mentions 0 and note "Not applicable").
 
 Return strict JSON with these exact keys:
-1. "prompt_evaluations": list of 5 objects (one for each buyer prompt above) with keys:
-   - "prompt": string (exact prompt text)
-   - "brand_mentioned": boolean (true if {brand} is realistically recommended/mentioned in AI answers today for this unbranded query in {market})
-   - "domain_cited": boolean (true if {domain} is likely cited as a source link)
-   - "competitors_recommended": list of competitor/incumbent brands typically recommended instead
-   - "simulated_ai_answer": string (concise 2-3 sentence realistic AI answer showing how an assistant answers this buyer query today)
-2. "competitive_snapshot": string (markdown comparison of {brand} vs {competitors[0]} and {competitors[1]} across AI entity recognition, third-party citations, review/directory presence, and content authority in {market})
-3. "serp_checks": list of 4 objects (one per core keyword) with keys:
-   - "keyword": string
-   - "brand_visibility": string (e.g. "Strong Branded", "Competing on Page 1", "Low / Displaced by Aggregators")
-   - "ai_overview_risk": string ("High - AI answers directly", "Medium", "Low")
-   - "dominant_domains": list of 2-3 domains/platforms dominating this query in {market}
-4. "schema_recommendations": list of 3 specific JSON-LD schema additions tailored to {domain} with exact rationale
-5. "top_3_opportunities": list of 3 objects, each with:
-   - "title": string
-   - "impact": string ("Critical" or "High")
-   - "effort": string ("Low", "Medium", or "High")
-   - "action_plan": string (specific, actionable steps tailored to {domain} and {market})
+{{
+  "executive_summary": "3-4 sentence executive takeaway on brand perception, AI citation readiness, and category narrative.",
+  "brand_health_score": integer (0-100),
+  "subscores": {{
+    "sentiment": {{"score": integer, "weight": "30%", "detail": "e.g. 58% positive across analyzed mentions"}},
+    "volume": {{"score": integer, "weight": "20%", "detail": "e.g. 185 total indexed mentions"}},
+    "reach": {{"score": integer, "weight": "20%", "detail": "e.g. Avg domain authority 410/1000"}},
+    "coverage": {{"score": integer, "weight": "15%", "detail": "e.g. 7 of 9 platforms active"}},
+    "freshness": {{"score": integer, "weight": "15%", "detail": "e.g. Active discussions in last 90 days"}}
+  }},
+  "channels": [
+    {{
+      "platform": "Reddit",
+      "mentions": integer,
+      "conversation_type": "Debate / Mixed | Question driven | Not applicable | Polarized | Mostly positive | Brand / Trade | Brand owned | Industry / Partner",
+      "note": "concise note"
+    }}
+    // include all 9 platforms in order: Reddit, Quora, G2, Web, News, X, YouTube, Facebook, Instagram
+  ],
+  "sentiment": {{
+    "headline": "2-4 word punchy headline e.g. A Polarized Conversation or Strong Niche Advocacy",
+    "intro": "2 sentence explanation of the sentiment split.",
+    "positive_pct": integer,
+    "negative_pct": integer,
+    "neutral_pct": integer,
+    "narrative": "2-3 sentence analytical callout explaining what drives positive vs negative perception.",
+    "quora_threads": [
+      {{"title": "real or realistic Quora question from evidence", "tag": "tag/topic", "url": "url if found"}}
+    ],
+    "reddit_threads": [
+      {{"title": "real or realistic Reddit thread from evidence", "tag": "r/subreddit", "url": "url if found"}}
+    ]
+  }},
+  "news_media": [
+    {{"outlet": "Publication/Site", "headline": "Article or mention title", "tone": "Positive | Neutral | Critical", "url": "url"}}
+  ],
+  "competitor_landscape": [
+    {{
+      "brand": "Brand Name",
+      "ai_visibility": "High | Medium | Low",
+      "sentiment_balance": "e.g. 64% Pos / 18% Neg",
+      "primary_moat": "what gives them AI/search authority"
+    }}
+  ],
+  "top_pain_points": [
+    {{"pain_point": "Specific friction/objection buyers raise online", "frequency": "High | Medium", "aeo_impact": "How this hurts LLM recommendations"}}
+  ],
+  "response_playbook": [
+    {{"channel": "Reddit / Quora / Review Sites", "trigger": "What thread type to target", "recommended_response": "Exact positioning angle"}}
+  ],
+  "content_strategy": [
+    {{"pillar": "Content / Schema Asset to Build", "target_queries": "Buyer prompts this captures", "execution_step": "Concrete action"}}
+  ]
+}}
 """
-    audit_resp = generate_with_resilience(
+    synth_resp = generate_with_resilience(
         client=client,
         primary_model=model_name,
-        contents=audit_prompt,
-        config=types.GenerateContentConfig(
-            tools=tools_list,
-            response_mime_type="application/json",
-            temperature=0.2,
-        ),
+        contents=synthesis_prompt,
+        config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.25),
     )
-    synthesis = safe_json_loads(audit_resp.text)
-
-    # Extract grounded URLs if search grounding was enabled
-    grounded_urls = []
-    cand = audit_resp.candidates[0] if audit_resp.candidates else None
-    if cand and cand.grounding_metadata and cand.grounding_metadata.grounding_chunks:
-        for chunk in cand.grounding_metadata.grounding_chunks:
-            if chunk.web and chunk.web.uri:
-                grounded_urls.append(chunk.web.uri)
-
-    prompt_results = []
-    brand_mentions = 0
-    brand_citations = 0
-
-    for item in synthesis.get("prompt_evaluations", []):
-        m_bool = bool(item.get("brand_mentioned"))
-        c_bool = bool(item.get("domain_cited"))
-        if m_bool:
-            brand_mentions += 1
-        if c_bool:
-            brand_citations += 1
-        comps = item.get("competitors_recommended") or []
-        prompt_results.append(
-            {
-                "Prompt": item.get("prompt", ""),
-                "Brand Mentioned": "✅ Yes" if m_bool else "❌ No",
-                "Domain Cited": "✅ Yes" if c_bool else "❌ No",
-                "Competitors Recommended": ", ".join(comps) if comps else "None / Other brands",
-                "AI Answer Snippet": item.get("simulated_ai_answer", ""),
-            }
-        )
-
-    return {
-        "plan": plan,
-        "brand_mentions": brand_mentions,
-        "brand_citations": brand_citations,
-        "prompt_results": prompt_results,
-        "grounded_urls": grounded_urls[:10],
-        "synthesis": synthesis,
-    }
+    report = safe_json_loads(synth_resp.text)
+    report["entity"] = entity
+    report["raw_evidence"] = compact_evidence
+    return report
 
 
-# --- UI LAYOUT ---
-st.title("🔍 AEO & AI Visibility Auditor")
-st.caption(
-    "6-section Answer Engine Optimization audit: checks AI crawler access, schema gaps, "
-    "unbranded buyer prompt visibility, competitor share of voice, and SERP displacement."
-)
-
+# --- SIDEBAR NAVIGATION & INPUTS ---
 with st.sidebar:
-    st.header("Configuration")
+    st.markdown("### 🧬 BRAND INTELLIGENCE")
+    st.caption(f"Report Date: {datetime.date.today().strftime('%B %d, %Y')}")
+    st.divider()
+
     api_key = st.secrets.get("GEMINI_API_KEY", "") if hasattr(st, "secrets") else ""
     if not api_key:
         api_key = st.text_input("Gemini API Key", type="password", help="Or set GEMINI_API_KEY in Streamlit Secrets")
 
-    model_name = st.selectbox(
-        "Primary Gemini Model",
-        MODEL_CANDIDATES,
-        index=0,
-    )
-    use_search_grounding = st.checkbox(
-        "Enable Live Google Search Grounding",
-        value=False,
-        help="Requires a paid Tier 1+ Gemini API billing account (5,000 free grounded calls/mo). Leave unchecked on the $0 Free Tier.",
-    )
+    target_url = st.text_input("Target Website URL", placeholder="[https://courthaus.club](https://courthaus.club)")
     market = st.selectbox(
         "Target Market",
-        ["India", "United States", "United Kingdom", "Singapore", "United Arab Emirates", "Australia", "Global"],
+        ["India", "United States", "United Kingdom", "Singapore", "Australia", "Global"],
         index=0,
     )
-    comp_input = st.text_input(
-        "Optional: 2 Direct Competitors (comma-separated)",
-        placeholder="e.g., Hudle, Playo (leave blank to auto-detect)",
-    )
-    concern = st.text_area(
-        "Biggest AEO / Visibility Concern (optional)",
-        placeholder="e.g., We rank on Google but ChatGPT/Gemini recommend competitors instead.",
-        height=80,
+    comp_input = st.text_input("Competitors (optional)", placeholder="Hudle, Playo, District")
+    model_name = st.selectbox("Model", MODEL_CANDIDATES, index=0)
+    run_btn = st.button("Generate Report", type="primary", use_container_width=True)
+
+    st.divider()
+    st.markdown(
+        """
+        <div style="font-family:monospace;font-size:0.8rem;line-height:2.0;color:#94a3b8;">
+        <div style="color:#22d3ee;font-weight:700;">REPORT SECTIONS</div>
+        <a href="#cover" style="color:#cbd5e1;text-decoration:none;">Cover</a><br>
+        <a href="#01-executive-summary" style="color:#cbd5e1;text-decoration:none;">01 Executive Summary</a><br>
+        <a href="#02-brand-health-score" style="color:#cbd5e1;text-decoration:none;">02 Brand Health Score</a><br>
+        <a href="#03-channel-overview" style="color:#cbd5e1;text-decoration:none;">03 Channel Overview</a><br>
+        <a href="#04-sentiment-analysis" style="color:#cbd5e1;text-decoration:none;">04 Sentiment Analysis</a><br>
+        <a href="#05-news-media-coverage" style="color:#cbd5e1;text-decoration:none;">05 News &amp; Media Coverage</a><br>
+        <a href="#06-competitor-landscape" style="color:#cbd5e1;text-decoration:none;">06 Competitor Landscape</a><br>
+        <a href="#07-top-pain-points" style="color:#cbd5e1;text-decoration:none;">07 Top Pain Points</a><br>
+        <div style="color:#475569;font-size:0.7rem;margin-top:8px;">PLAYBOOK &amp; STRATEGY</div>
+        <a href="#08-full-thread-analysis" style="color:#cbd5e1;text-decoration:none;">08 Full Thread Analysis</a><br>
+        <a href="#09-response-playbook" style="color:#cbd5e1;text-decoration:none;">09 Response Playbook</a><br>
+        <a href="#10-content-strategy" style="color:#cbd5e1;text-decoration:none;">10 Content Strategy</a>
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
 
-col_url, col_btn = st.columns([4, 1])
-with col_url:
-    target_url = st.text_input("Website URL", placeholder="[https://example.com](https://example.com)", label_visibility="collapsed")
-with col_btn:
-    run_audit = st.button("Run AEO Audit", type="primary", use_container_width=True)
-
-if run_audit:
+# --- EXECUTION ---
+if run_btn:
     if not api_key:
-        st.error("Please provide a Gemini API key in the sidebar or via Streamlit Secrets (`GEMINI_API_KEY`).")
+        st.error("Add your Gemini API Key in the sidebar or Streamlit Secrets.")
         st.stop()
     if not target_url.strip():
-        st.warning("Enter a valid website URL.")
+        st.warning("Enter a website URL first.")
         st.stop()
 
     clean_url = normalize_url(target_url)
-    competitors_override = [c.strip() for c in comp_input.split(",") if c.strip()][:2]
+    comps = [c.strip() for c in comp_input.split(",") if c.strip()][:3]
 
-    with st.status("Running 6-Point AEO Audit...", expanded=True) as status:
-        st.write("1/3 Crawling page structure, `robots.txt`, `llms.txt`, and JSON-LD schema...")
-        try:
-            crawl_data = crawl_site(clean_url)
-        except Exception as e:
-            st.error(f"Failed to crawl `{clean_url}`: {e}")
-            st.stop()
+    with st.status("Building Brand Intelligence & AEO Report...", expanded=True) as status:
+        st.write("1/3 Crawling homepage metadata, headings, and JSON-LD entities...")
+        crawl_data = crawl_homepage(clean_url)
 
-        st.write("2/3 Evaluating unbranded buyer prompts, competitors & SERP visibility...")
+        st.write("2/3 Harvesting live Reddit, Quora, News, Web & Social mentions...")
         client = genai.Client(api_key=api_key)
-        try:
-            audit_data = run_llm_and_serp_audit(
-                client=client,
-                model_name=model_name,
-                use_search_grounding=use_search_grounding,
-                crawl_data=crawl_data,
-                market=market,
-                competitors_override=competitors_override,
-                concern=concern,
-            )
-        except Exception as e:
-            st.error(f"LLM Visibility Audit failed: {e}")
-            st.stop()
+        report = run_brand_intelligence_pipeline(client, model_name, crawl_data, market, comps)
 
-        st.write("3/3 Rendering 6-section AEO report...")
-        status.update(label="AEO Audit Complete!", state="complete", expanded=False)
+        st.write("3/3 Scoring brand health, sentiment polarity & competitor landscape...")
+        status.update(label="Report Ready", state="complete", expanded=False)
 
-    plan = audit_data["plan"]
-    synth = audit_data["synthesis"]
+    st.session_state["bi_report"] = report
+    st.session_state["bi_crawl"] = crawl_data
 
-    st.divider()
-    st.subheader(f"AEO Visibility Report: {plan['brand_name']} (`{crawl_data['domain']}`)")
-    st.caption(
-        f"Category: **{plan['category']}** | Market: **{market}** | "
-        f"Benchmarked Competitors: **{', '.join(plan['competitors'])}**"
-    )
+# --- RENDER REPORT ---
+if "bi_report" not in st.session_state:
+    st.info("👈 Paste any website URL in the left sidebar and click **Generate Report** to build an executive Brand Intelligence & AEO report.")
+    st.stop()
 
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("AEO Readiness Score", f"{crawl_data['readiness_score']}/100")
-    m2.metric("LLM Brand Mentions", f"{audit_data['brand_mentions']} / 5 prompts")
-    m3.metric("Direct Domain Citations", f"{audit_data['brand_citations']} / 5 prompts")
-    m4.metric("Schemas Detected", f"{len(crawl_data['schemas_found'])}")
+report = st.session_state["bi_report"]
+crawl = st.session_state["bi_crawl"]
+entity = report["entity"]
+channels = report.get("channels", [])
+total_mentions = sum(c.get("mentions", 0) for c in channels)
+active_platforms = sum(1 for c in channels if c.get("mentions", 0) > 0)
+sent = report.get("sentiment", {})
+neg_share = sent.get("negative_pct", 0)
+health_score = report.get("brand_health_score", 60)
 
-    st.markdown("### 1. LLM Visibility Check (Unbranded Buyer Prompts)")
-    df_prompts = pd.DataFrame(audit_data["prompt_results"])
-    st.dataframe(
-        df_prompts[["Prompt", "Brand Mentioned", "Domain Cited", "Competitors Recommended"]],
-        use_container_width=True,
-        hide_index=True,
-    )
-    with st.expander("View Sample AI Responses"):
-        for row in audit_data["prompt_results"]:
-            st.markdown(f"**Prompt:** {row['Prompt']}")
-            st.write(row["AI Answer Snippet"])
-            st.divider()
+# === COVER ===
+st.markdown('<div id="cover"></div>', unsafe_allow_html=True)
+st.markdown(f'<h1 class="hero-brand">{entity["brand_name"]}</h1>', unsafe_allow_html=True)
+st.markdown('<h2 class="hero-sub">Brand Intelligence Report</h2>', unsafe_allow_html=True)
+st.markdown(
+    f'<div class="hero-meta">Quora, Reddit and {max(0, active_platforms - 2)} more channels for {crawl["domain"]}<br>'
+    f'{datetime.date.today().strftime("%B %d, %Y")} &nbsp;|&nbsp; {market} Market &nbsp;|&nbsp; Automated AEO Audit</div>',
+    unsafe_allow_html=True,
+)
 
-    st.markdown("### 2. Competitive Snapshot")
-    st.markdown(synth.get("competitive_snapshot", ""))
+st.markdown(render_donut_svg(health_score, "Brand Health Score", 200), unsafe_allow_html=True)
 
-    st.markdown("### 3. AEO Readiness Score & AI Bot Access")
-    c_left, c_right = st.columns(2)
-    with c_left:
-        st.markdown("**Score Breakdown**")
-        for k, v in crawl_data["score_breakdown"].items():
-            st.write(f"- **{k}:** {v}")
-        st.write(f"- **`llms.txt` Present:** {'✅ Yes' if crawl_data['bots_and_llms']['llms_txt_found'] else '❌ Missing'}")
-        st.write(f"- **Question-Based Headings:** {len(crawl_data['question_headings'])} found")
-    with c_right:
-        st.markdown("**AI Crawler Permissions (`robots.txt`)**")
-        bot_df = pd.DataFrame(
-            [{"AI Crawler": k, "Status": v} for k, v in crawl_data["bots_and_llms"]["bot_status"].items()]
+k1, k2, k3 = st.columns([1, 1, 1])
+with k1:
+    st.markdown(f'<div class="kpi-box"><div class="kpi-val">{total_mentions}</div><div class="kpi-lbl">Mentions</div></div>', unsafe_allow_html=True)
+with k2:
+    st.markdown(f'<div class="kpi-box"><div class="kpi-val">{active_platforms} / {len(channels)}</div><div class="kpi-lbl">Platforms</div></div>', unsafe_allow_html=True)
+with k3:
+    st.markdown(f'<div class="kpi-box"><div class="kpi-val-red">{neg_share}%</div><div class="kpi-lbl">Negative Share</div></div>', unsafe_allow_html=True)
+
+pill_colors = {
+    "Reddit": ("rgba(249,115,22,0.15)", "#fb923c"),
+    "Quora": ("rgba(234,179,8,0.15)", "#facc15"),
+    "G2": ("rgba(239,68,68,0.15)", "#f87171"),
+    "Web": ("rgba(56,189,248,0.15)", "#38bdf8"),
+    "News": ("rgba(16,185,129,0.15)", "#34d399"),
+    "X": ("rgba(148,163,184,0.15)", "#94a3b8"),
+    "YouTube": ("rgba(244,63,94,0.15)", "#fb7185"),
+    "Facebook": ("rgba(59,130,246,0.15)", "#60a5fa"),
+    "Instagram": ("rgba(168,85,247,0.15)", "#c084fc"),
+}
+pills_html = '<div class="pill-row">'
+for c in channels:
+    p = c["platform"]
+    bg, fg = pill_colors.get(p, ("rgba(148,163,184,0.15)", "#cbd5e1"))
+    pills_html += f'<span class="plat-pill" style="background:{bg};color:{fg};">{p}</span>'
+pills_html += "</div>"
+st.markdown(pills_html, unsafe_allow_html=True)
+
+st.markdown('<hr class="report-divider">', unsafe_allow_html=True)
+
+# === 01 EXECUTIVE SUMMARY ===
+st.markdown('<div id="01-executive-summary"></div>', unsafe_allow_html=True)
+st.markdown('<div class="section-kicker">// 01 EXECUTIVE SUMMARY</div>', unsafe_allow_html=True)
+st.markdown("### Strategic Intelligence Overview")
+st.info(report.get("executive_summary", ""))
+
+st.markdown('<hr class="report-divider">', unsafe_allow_html=True)
+
+# === 02 BRAND HEALTH SCORE ===
+st.markdown('<div id="02-brand-health-score"></div>', unsafe_allow_html=True)
+st.markdown('<div class="section-kicker">// 02 BRAND HEALTH SCORE</div>', unsafe_allow_html=True)
+st.markdown(f"## Your Brand Health: {health_score}/100")
+
+col_ring, col_cards = st.columns([1, 1.6])
+with col_ring:
+    st.markdown("<br><br>", unsafe_allow_html=True)
+    st.markdown(render_donut_svg(health_score, "out of 100", 230), unsafe_allow_html=True)
+
+with col_cards:
+    sub = report.get("subscores", {})
+    score_rows = [
+        ("Sentiment Score", sub.get("sentiment", {})),
+        ("Volume Score", sub.get("volume", {})),
+        ("Reach Score", sub.get("reach", {})),
+        ("Coverage Score", sub.get("coverage", {})),
+        ("Freshness Score", sub.get("freshness", {})),
+    ]
+    for label, obj in score_rows:
+        sc = obj.get("score", 50)
+        sc_color = "#34d399" if sc >= 70 else "#facc15" if sc >= 45 else "#f87171"
+        st.markdown(
+            f"""
+            <div class="subscore-card">
+                <div>
+                    <div style="color:#94a3b8;font-size:0.85rem;">{label}</div>
+                    <div style="font-size:1.35rem;font-weight:800;color:{sc_color};">{sc} <span style="font-size:0.85rem;color:#64748b;">/ 100</span></div>
+                </div>
+                <div style="text-align:right;">
+                    <div style="font-family:monospace;font-size:0.8rem;color:#eab308;">{obj.get('weight', '')} weight</div>
+                    <div style="font-size:0.8rem;color:#64748b;">{obj.get('detail', '')}</div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
         )
-        st.dataframe(bot_df, use_container_width=True, hide_index=True)
 
-    st.markdown("### 4. SERP & Google AI Overview Position Check")
-    if synth.get("serp_checks"):
-        st.dataframe(pd.DataFrame(synth["serp_checks"]), use_container_width=True, hide_index=True)
+st.markdown('<hr class="report-divider">', unsafe_allow_html=True)
 
-    st.markdown("### 5. Schema Gap Analysis")
-    s1, s2 = st.columns(2)
-    with s1:
-        st.success(f"**Detected JSON-LD Types:** {', '.join(crawl_data['schemas_found']) or 'None detected'}")
-    with s2:
-        st.warning(f"**Missing High-Value Types:** {', '.join(crawl_data['schemas_missing'])}")
-    for rec in synth.get("schema_recommendations", []):
-        st.write(f"- {rec}")
+# === 03 CHANNEL OVERVIEW ===
+st.markdown('<div id="03-channel-overview"></div>', unsafe_allow_html=True)
+st.markdown('<div class="section-kicker">// 03 CHANNEL OVERVIEW</div>', unsafe_allow_html=True)
+st.markdown("## Where Your Brand Lives Online")
 
-    st.markdown("### 6. Top 3 High-Impact AEO Opportunities")
-    for idx, opp in enumerate(synth.get("top_3_opportunities", [])[:3], start=1):
-        with st.container(border=True):
-            st.markdown(f"**#{idx}: {opp.get('title')}** — Impact: `{opp.get('impact')}` | Effort: `{opp.get('effort')}`")
-            st.write(opp.get("action_plan"))
+badge_styles = {
+    "Debate / Mixed": ("rgba(234,179,8,0.16)", "#facc15"),
+    "Polarized": ("rgba(249,115,22,0.16)", "#fb923c"),
+    "Question driven": ("rgba(148,163,184,0.16)", "#cbd5e1"),
+    "Not applicable": ("rgba(100,116,139,0.16)", "#94a3b8"),
+    "Mostly positive": ("rgba(16,185,129,0.16)", "#34d399"),
+    "Brand / Trade": ("rgba(148,163,184,0.16)", "#cbd5e1"),
+    "Brand owned": ("rgba(34,211,238,0.16)", "#22d3ee"),
+    "Industry / Partner": ("rgba(16,185,129,0.16)", "#34d399"),
+}
 
-    if audit_data["grounded_urls"]:
-        with st.expander("Grounded Google Search Sources Used"):
-            for u in audit_data["grounded_urls"]:
-                st.write(f"- {u}")
+table_html = """
+<table style="width:100%;border-collapse:collapse;background:#11161f;border-radius:10px;overflow:hidden;border:1px solid #1e293b;">
+  <thead>
+    <tr style="border-bottom:1px solid #1e293b;text-align:left;font-family:monospace;font-size:0.78rem;color:#64748b;">
+      <th style="padding:14px 18px;">PLATFORM</th>
+      <th style="padding:14px 18px;text-align:center;">MENTIONS</th>
+      <th style="padding:14px 18px;">CONVERSATION TYPE</th>
+      <th style="padding:14px 18px;">NOTE</th>
+    </tr>
+  </thead>
+  <tbody>
+"""
+for ch in channels:
+    plat = ch.get("platform", "")
+    _, p_color = pill_colors.get(plat, ("", "#22d3ee"))
+    ctype = ch.get("conversation_type", "Question driven")
+    b_bg, b_fg = badge_styles.get(ctype, ("rgba(148,163,184,0.16)", "#cbd5e1"))
+    table_html += f"""
+    <tr style="border-bottom:1px solid #1a2230;">
+      <td style="padding:14px 18px;font-weight:700;color:{p_color};font-family:monospace;">{plat}</td>
+      <td style="padding:14px 18px;text-align:center;font-weight:700;color:#f8fafc;">{ch.get('mentions', 0)}</td>
+      <td style="padding:14px 18px;"><span class="badge" style="background:{b_bg};color:{b_fg};">{ctype}</span></td>
+      <td style="padding:14px 18px;color:#94a3b8;font-size:0.88rem;">{ch.get('note', '')}</td>
+    </tr>
+    """
+table_html += f"""
+    <tr style="background:#0d1219;">
+      <td style="padding:14px 18px;font-weight:800;color:#f8fafc;font-family:monospace;">Total analyzed</td>
+      <td style="padding:14px 18px;text-align:center;font-weight:800;color:#22d3ee;">{total_mentions}</td>
+      <td></td>
+      <td></td>
+    </tr>
+  </tbody>
+</table>
+"""
+st.markdown(table_html, unsafe_allow_html=True)
 
-    report_payload = json.dumps(
-        {"crawl_data": crawl_data, "audit_data": audit_data},
-        indent=2,
-        default=str,
-    )
-    st.download_button(
-        label="⬇️ Download Full Audit Data (JSON)",
-        data=report_payload,
-        file_name=f"aeo_audit_{crawl_data['domain']}.json",
-        mime="application/json",
-    )
+st.markdown('<hr class="report-divider">', unsafe_allow_html=True)
+
+# === 04 SENTIMENT ANALYSIS ===
+st.markdown('<div id="04-sentiment-analysis"></div>', unsafe_allow_html=True)
+st.markdown('<div class="section-kicker">// 04 SENTIMENT ANALYSIS</div>', unsafe_allow_html=True)
+st.markdown(f"## {sent.get('headline', 'Conversation Polarity')}")
+st.write(sent.get("intro", ""))
+
+pos_p = sent.get("positive_pct", 50)
+neg_p = sent.get("negative_pct", 25)
+neu_p = sent.get("neutral_pct", 25)
+
+sc1, sc2, sc3 = st.columns(3)
+with sc1:
+    st.markdown(f'<div class="sent-card-pos"><div style="font-family:monospace;font-size:0.75rem;color:#34d399;">POSITIVE</div><div style="font-size:2.2rem;font-weight:800;color:#34d399;">{pos_p}%</div></div>', unsafe_allow_html=True)
+with sc2:
+    st.markdown(f'<div class="sent-card-neg"><div style="font-family:monospace;font-size:0.75rem;color:#f87171;">NEGATIVE</div><div style="font-size:2.2rem;font-weight:800;color:#f87171;">{neg_p}%</div></div>', unsafe_allow_html=True)
+with sc3:
+    st.markdown(f'<div class="sent-card-neu"><div style="font-family:monospace;font-size:0.75rem;color:#94a3b8;">NEUTRAL</div><div style="font-size:2.2rem;font-weight:800;color:#e2e8f0;">{neu_p}%</div></div>', unsafe_allow_html=True)
+
+st.markdown(
+    f"""
+    <div style="margin:1.4rem 0 0.5rem 0;font-family:monospace;font-size:0.75rem;color:#64748b;">OVERALL SENTIMENT DISTRIBUTION</div>
+    <div style="display:flex;width:100%;height:26px;border-radius:6px;overflow:hidden;font-family:monospace;font-size:0.75rem;font-weight:700;">
+      <div style="width:{pos_p}%;background:#22c55e;color:#052e16;display:flex;align-items:center;justify-content:center;">{pos_p}%</div>
+      <div style="width:{neg_p}%;background:#ef4444;color:#fff;display:flex;align-items:center;justify-content:center;">{neg_p}%</div>
+      <div style="width:{neu_p}%;background:#64748b;color:#fff;display:flex;align-items:center;justify-content:center;">{neu_p}%</div>
+    </div>
+    <p style="color:#94a3b8;font-size:0.92rem;margin-top:0.9rem;">{sent.get('narrative', '')}</p>
+    """,
+    unsafe_allow_html=True,
+)
+
+tq, tr = st.columns(2)
+with tq:
+    st.markdown("#### On Quora")
+    for item in sent.get("quora_threads", [])[:3]:
+        st.markdown(
+            f'<div class="thread-card"><div style="font-weight:600;color:#e2e8f0;margin-bottom:6px;">"{item.get("title", "")}"</div>'
+            f'<span class="badge" style="background:rgba(34,211,238,0.14);color:#22d3ee;">{item.get("tag", "Quora")}</span></div>',
+            unsafe_allow_html=True,
+        )
+with tr:
+    st.markdown("#### On Reddit")
+    for item in sent.get("reddit_threads", [])[:3]:
+        st.markdown(
+            f'<div class="thread-card"><div style="font-weight:600;color:#e2e8f0;margin-bottom:6px;">"{item.get("title", "")}"</div>'
+            f'<span class="badge" style="background:rgba(249,115,22,0.14);color:#fb923c;">{item.get("tag", "Reddit")}</span></div>',
+            unsafe_allow_html=True,
+        )
+
+st.markdown('<hr class="report-divider">', unsafe_allow_html=True)
+
+# === 05 NEWS & MEDIA COVERAGE ===
+st.markdown('<div id="05-news-media-coverage"></div>', unsafe_allow_html=True)
+st.markdown('<div class="section-kicker">// 05 NEWS & MEDIA COVERAGE</div>', unsafe_allow_html=True)
+st.markdown("## Press & Third-Party Authority Signals")
+if report.get("news_media"):
+    st.dataframe(pd.DataFrame(report["news_media"]), use_container_width=True, hide_index=True)
+
+st.markdown('<hr class="report-divider">', unsafe_allow_html=True)
+
+# === 06 COMPETITOR LANDSCAPE ===
+st.markdown('<div id="06-competitor-landscape"></div>', unsafe_allow_html=True)
+st.markdown('<div class="section-kicker">// 06 COMPETITOR LANDSCAPE</div>', unsafe_allow_html=True)
+st.markdown("## Category Share of Voice & AI Authority")
+if report.get("competitor_landscape"):
+    st.dataframe(pd.DataFrame(report["competitor_landscape"]), use_container_width=True, hide_index=True)
+
+st.markdown('<hr class="report-divider">', unsafe_allow_html=True)
+
+# === 07 TOP PAIN POINTS ===
+st.markdown('<div id="07-top-pain-points"></div>', unsafe_allow_html=True)
+st.markdown('<div class="section-kicker">// 07 TOP PAIN POINTS</div>', unsafe_allow_html=True)
+st.markdown("## Buyer Objections & AEO Friction")
+for pp in report.get("top_pain_points", []):
+    with st.container(border=True):
+        st.markdown(f"**{pp.get('pain_point')}** &nbsp; `{pp.get('frequency')} Frequency`")
+        st.caption(f"AEO Impact: {pp.get('aeo_impact')}")
+
+st.markdown('<hr class="report-divider">', unsafe_allow_html=True)
+
+# === 08 FULL THREAD ANALYSIS (LIVE HARVESTED EVIDENCE) ===
+st.markdown('<div id="08-full-thread-analysis"></div>', unsafe_allow_html=True)
+st.markdown('<div class="section-kicker">// 08 FULL THREAD ANALYSIS</div>', unsafe_allow_html=True)
+st.markdown("## Harvested Live Citations & Threads")
+for ch_name, items in report.get("raw_evidence", {}).items():
+    if items:
+        with st.expander(f"{ch_name} ({len(items)} sampled sources)"):
+            for it in items:
+                st.markdown(f"**[{it.get('title')}]({it.get('url')})**")
+                st.caption(it.get("snippet"))
+
+st.markdown('<hr class="report-divider">', unsafe_allow_html=True)
+
+# === 09 RESPONSE PLAYBOOK ===
+st.markdown('<div id="09-response-playbook"></div>', unsafe_allow_html=True)
+st.markdown('<div class="section-kicker">// 09 RESPONSE PLAYBOOK</div>', unsafe_allow_html=True)
+st.markdown("## Community & Citation Intervention Playbook")
+if report.get("response_playbook"):
+    st.dataframe(pd.DataFrame(report["response_playbook"]), use_container_width=True, hide_index=True)
+
+st.markdown('<hr class="report-divider">', unsafe_allow_html=True)
+
+# === 10 CONTENT STRATEGY ===
+st.markdown('<div id="10-content-strategy"></div>', unsafe_allow_html=True)
+st.markdown('<div class="section-kicker">// 10 CONTENT STRATEGY</div>', unsafe_allow_html=True)
+st.markdown("## AEO Content & Schema Roadmap")
+for step in report.get("content_strategy", []):
+    with st.container(border=True):
+        st.markdown(f"**{step.get('pillar')}** — *Target Queries: {step.get('target_queries')}*")
+        st.write(step.get("execution_step"))
+
+st.download_button(
+    "⬇️ Export Full Report (JSON)",
+    data=json.dumps(report, indent=2),
+    file_name=f"brand_intelligence_{crawl['domain']}.json",
+    mime="application/json",
+)
